@@ -192,7 +192,7 @@ impl Display for Ast {
 
 impl Ast {
     fn eval(&self) -> i32 {
-        let v = match self {
+        match self {
             Ast::Atom(token) => match token {
                 TokenTree::Ident(_) => todo!(),
                 TokenTree::IntLit(n) => *n as _,
@@ -220,10 +220,14 @@ impl Ast {
                 InfixOp::Mul => operands.0.eval() * operands.1.eval(),
                 InfixOp::Div => operands.0.eval() / operands.1.eval(),
             },
-            Ast::FunctionCall { fun, args } => todo!(),
-        };
-        println!("  {} => {}", self, v);
-        v
+            Ast::FunctionCall { fun, args } => match **fun {
+                Ast::Atom(TokenTree::Ident(ref n)) if n == "dbg" => {
+                    println!("dbg: {:?}", args);
+                    args.first().map(Ast::eval).unwrap_or_default()
+                }
+                _ => todo!(),
+            },
+        }
     }
 }
 
@@ -261,7 +265,7 @@ where
     // returns (u8, ()) to be clear it's a postfix
     fn postfix_bp(op: &TokenTree) -> Option<(u8, ())> {
         match op {
-            TokenTree::Punct(Punct::Bang) => Some((7, ())),
+            TokenTree::Punct(Punct::Bang) | TokenTree::ParenGroup { .. } => Some((7, ())),
             _ => None,
         }
     }
@@ -293,6 +297,7 @@ where
                     break;
                 }
                 Some(tok @ TokenTree::Punct(p)) if p.is_op() => tok,
+                Some(tok @ TokenTree::ParenGroup { .. }) => tok,
                 tok => panic!("Unexpected token: {:?}", tok),
             };
 
@@ -307,7 +312,7 @@ where
                         let mut args = Vec::new();
                         let mut parser = Parser::new(tokens.iter().cloned());
                         while parser.lexer.peek().is_some() {
-                            args.push(self.parse_expr()?);
+                            args.push(parser.parse_expr().unwrap());
                             match self.lexer.next() {
                                 Some(TokenTree::Punct(Punct::Comma)) => continue,
                                 Some(tok) => panic!("Unexpected token: {:?}", tok),
@@ -353,7 +358,7 @@ where
                 continue;
             }
 
-            unreachable!()
+            unreachable!();
         }
 
         Some(lhs)
