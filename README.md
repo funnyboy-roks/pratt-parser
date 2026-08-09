@@ -5,7 +5,7 @@ A toy interpreter created so I can play around with Pratt Parsing
 
 Fibonacci Numbers in this language (using recursion):
 
-```js
+```rust
 let f = (n) => if n <= 2 { 1 } else { f(n - 1) + f(n - 2) };
 
 f(10) // 55
