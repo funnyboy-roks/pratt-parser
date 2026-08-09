@@ -1,3 +1,4 @@
 # Pratt Parser
 
-This is a toy Pratt Parser based on <https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html>
+A toy interpreter created so I can play around with Pratt Parsing
+(implementation based on <https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html>)

@@ -631,18 +631,18 @@ fn main() {
         let lex = Lexer::new(&l);
         println!("Token Trees:");
         for t in lex {
-            println!("  {:?}", t);
+            println!("    {:?}", t);
         }
 
         let lex = Lexer::new(&l);
         let mut parser = Parser::new(lex);
 
         let e = parser.parse_expr().unwrap();
-        println!("AST:");
+        print!("AST: ");
         e.print(0);
-        println!();
+        println!("\n");
         match e.eval(&mut variables) {
-            Ok(v) => println!("{}", v),
+            Ok(v) => println!("=> {}", v),
             Err(e) => println!("ERROR: {:?}", e),
         }
         print!("> ");
