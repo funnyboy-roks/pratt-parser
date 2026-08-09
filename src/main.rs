@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, io::Write, iter::Peekable};
+use std::{cmp::Ordering, collections::HashMap, fmt::Display, io::Write, iter::Peekable};
 
 #[cfg(test)]
 mod test;
@@ -6,12 +6,20 @@ mod test;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Keyword {
     Let,
+    True,
+    False,
+    If,
+    Else,
 }
 
 impl Keyword {
     pub fn from_ident(ident: &str) -> Option<Self> {
         match ident {
             "let" => Some(Self::Let),
+            "true" => Some(Self::True),
+            "false" => Some(Self::False),
+            "if" => Some(Self::If),
+            "else" => Some(Self::Else),
             _ => None,
         }
     }
@@ -25,7 +33,19 @@ enum Punct {
     Slash,
     Bang,
     Comma,
+    /// `=`
     Eq,
+    /// `==`
+    EqEq,
+    /// `<`
+    Lt,
+    /// `<=`
+    Lte,
+    /// `>`
+    Gt,
+    /// `>=`
+    Gte,
+    /// `=>`
     FatArrow,
     Semicolon,
 }
@@ -33,7 +53,17 @@ enum Punct {
 impl Punct {
     fn is_op(&self) -> bool {
         match self {
-            Self::Plus | Self::Minus | Self::Star | Self::Slash | Self::Bang | Self::Eq => true,
+            Self::Plus
+            | Self::Minus
+            | Self::Star
+            | Self::Slash
+            | Self::Bang
+            | Self::Eq
+            | Self::EqEq
+            | Self::Lt
+            | Self::Lte
+            | Self::Gt
+            | Self::Gte => true,
             Self::Comma | Self::Semicolon | Self::FatArrow => false,
         }
     }
@@ -148,7 +178,22 @@ impl<'a> Lexer<'a> {
             '/' => TokenTree::Punct(Punct::Slash),
             '!' => TokenTree::Punct(Punct::Bang),
             ',' => TokenTree::Punct(Punct::Comma),
+            '<' => match self.peek_char() {
+                Some('=') => {
+                    self.take_char();
+                    TokenTree::Punct(Punct::Lte)
+                }
+                _ => TokenTree::Punct(Punct::Lt),
+            },
+            '>' => match self.peek_char() {
+                Some('=') => {
+                    self.take_char();
+                    TokenTree::Punct(Punct::Gte)
+                }
+                _ => TokenTree::Punct(Punct::Gt),
+            },
             '=' => match self.take_char() {
+                Some('=') => TokenTree::Punct(Punct::EqEq),
                 Some('>') => TokenTree::Punct(Punct::FatArrow),
                 Some(c) => {
                     self.untake_char(c);
@@ -200,12 +245,42 @@ enum PostfixOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cmp {
+    Less,
+    LessOrEq,
+    GreaterOrEq,
+    Greater,
+}
+
+impl Cmp {
+    fn has_equal(self) -> bool {
+        match self {
+            Cmp::Less => false,
+            Cmp::LessOrEq => true,
+            Cmp::GreaterOrEq => true,
+            Cmp::Greater => false,
+        }
+    }
+
+    fn matches(self, ord: Ordering) -> bool {
+        match self {
+            Cmp::Less => matches!(ord, Ordering::Less),
+            Cmp::LessOrEq => matches!(ord, Ordering::Less | Ordering::Equal),
+            Cmp::GreaterOrEq => matches!(ord, Ordering::Greater | Ordering::Equal),
+            Cmp::Greater => matches!(ord, Ordering::Greater),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InfixOp {
     Add,
     Sub,
     Mul,
     Div,
     Assign,
+    Equality,
+    Cmp(Cmp),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +288,29 @@ struct Block {
     exprs: Vec<Ast>,
     /// whether the last expression should be treated as return value
     ret: bool,
+}
+
+impl Display for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{")?;
+        for (i, a) in self.exprs.iter().enumerate() {
+            write!(f, "{}", a)?;
+            if i < self.exprs.len() - 1 || self.ret {
+                write!(f, "; ")?;
+            }
+        }
+        write!(f, "}}")
+    }
+}
+
+impl Block {
+    fn eval(&self, variables: &mut HashMap<String, Value>) -> Result<Value, EvalError> {
+        let mut last = Value::Unit;
+        for e in &self.exprs {
+            last = e.eval(variables)?;
+        }
+        if self.ret { Ok(last) } else { Ok(Value::Unit) }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +345,11 @@ enum Ast {
     LambdaLit {
         args: Vec<String>,
         block: Block,
+    },
+    If {
+        cond: Box<Ast>,
+        body: Block,
+        elze: Option<Block>,
     },
 }
 
@@ -297,6 +400,13 @@ impl Display for Ast {
                 }
                 write!(f, ")")
             }
+            Ast::If { cond, body, elze } => {
+                write!(f, "(if {} {}", cond, body)?;
+                if let Some(elze) = elze {
+                    write!(f, " {}", elze)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -306,6 +416,7 @@ impl Display for Ast {
 enum Value {
     #[default]
     Unit,
+    Bool(bool),
     Integer(i32),
     NativeFn(fn(&[Value]) -> Value),
     LambdaFn {
@@ -319,6 +430,7 @@ impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Unit => write!(f, "()"),
+            Value::Bool(b) => write!(f, "{}", b),
             Value::Integer(n) => write!(f, "{}", n),
             Value::NativeFn(fun) => write!(f, "<function {:?}>", fun),
             Value::LambdaFn { .. } => write!(f, "<lambda>"),
@@ -339,6 +451,7 @@ impl Display for Value {
 #[derive(Debug)]
 enum EvalError {
     ExpectedVar,
+    ExpectedBool(Value),
     ExpectedInt(Value),
     ExpectedArray(Value),
     ExpectedFunction(Value),
@@ -355,6 +468,8 @@ impl Ast {
                     .ok_or_else(|| EvalError::UndefinedVariable(ident.clone()))
                     .cloned(),
                 TokenTree::IntLit(n) => Ok(Value::Integer(*n as _)),
+                TokenTree::Keyword(Keyword::True) => Ok(Value::Bool(true)),
+                TokenTree::Keyword(Keyword::False) => Ok(Value::Bool(false)),
                 _ => unreachable!(),
             },
             Ast::ArrayLit(items) => {
@@ -409,6 +524,30 @@ impl Ast {
                         Ast::Index { .. } => Err(EvalError::ExpectedVar),
                         _ => Err(EvalError::ExpectedVar),
                     },
+                    InfixOp::Equality => {
+                        let lhs = operands.0.eval(variables)?;
+                        let rhs = operands.1.eval(variables)?;
+
+                        Ok(Value::Bool(lhs == rhs))
+                    }
+                    InfixOp::Cmp(cmp) => {
+                        let lhs = operands.0.eval(variables)?;
+                        let rhs = operands.1.eval(variables)?;
+
+                        let result = match (lhs, rhs) {
+                            (Value::Unit, Value::Unit) => cmp.has_equal(),
+                            (Value::Bool(l), Value::Bool(r)) => cmp.matches(l.cmp(&r)),
+                            (Value::Integer(l), Value::Integer(r)) => cmp.matches(l.cmp(&r)),
+                            (Value::NativeFn(_), Value::NativeFn(_)) => false,
+                            (Value::LambdaFn { .. }, Value::LambdaFn { .. }) => false,
+                            (Value::Array(_), Value::Array(_)) => {
+                                false // TODO
+                            }
+                            _ => false,
+                        };
+
+                        Ok(Value::Bool(result))
+                    }
                 }
             }
             Ast::FunctionCall {
@@ -470,152 +609,24 @@ impl Ast {
                 variables.insert(var.clone(), val);
                 Ok(Value::Unit)
             }
-            Ast::Block(Block { exprs, ret }) => {
-                let mut last = Value::Unit;
-                for e in exprs {
-                    last = e.eval(variables)?;
-                }
-                if *ret { Ok(last) } else { Ok(Value::Unit) }
-            }
+            Ast::Block(b) => b.eval(variables),
             Ast::LambdaLit { args, block } => Ok(Value::LambdaFn {
                 args: args.clone(),
                 body: block.clone(),
             }),
-        }
-    }
+            Ast::If { cond, body, elze } => {
+                let cond = match cond.eval(variables)? {
+                    Value::Bool(b) => b,
+                    v => return Err(EvalError::ExpectedBool(v)),
+                };
 
-    fn print(&self, indent: usize) {
-        fn print_indent(indent: usize) {
-            print!("{:>gap$}", "", gap = indent * 4);
-        }
-        match self {
-            Ast::Atom(token_tree) => print!("{:?}", token_tree),
-            Ast::ArrayLit(asts) => {
-                println!("ArrayLit [");
-                for a in asts {
-                    print_indent(indent + 1);
-                    a.print(indent + 1);
-                    println!(",");
-                }
-                print_indent(indent);
-                print!("]");
-            }
-            Ast::PrefixOp { op, operand } => {
-                println!("PrefixOp {{");
-                print_indent(indent + 1);
-                println!("op: {:?},", op);
-                print_indent(indent + 1);
-                print!("operand: ");
-                operand.print(indent + 1);
-                println!(",");
-                print_indent(indent);
-                print!("}}");
-            }
-            Ast::PostfixOp { op, operand } => {
-                println!("PostfixOp {{");
-                print_indent(indent + 1);
-                println!("op: {:?},", op);
-                print_indent(indent + 1);
-                print!("operand: ");
-                operand.print(indent + 1);
-                println!(",");
-                print_indent(indent);
-                print!("}}");
-            }
-            Ast::BinOp { op, operands } => {
-                println!("BinOp {{");
-                print_indent(indent + 1);
-                println!("op: {:?},", op);
-                print_indent(indent + 1);
-                print!("lhs: ");
-                operands.0.print(indent + 1);
-                println!(",");
-                print_indent(indent + 1);
-                print!("rhs: ");
-                operands.1.print(indent + 1);
-                println!(",");
-                print_indent(indent);
-                print!("}}");
-            }
-            Ast::FunctionCall { fun, args } => {
-                println!("FunctionCall {{");
-                print_indent(indent + 1);
-                print!("fun: ");
-                fun.print(indent + 1);
-                println!(",");
-                print_indent(indent + 1);
-                println!("args: [");
-                for a in args {
-                    print_indent(indent + 2);
-                    a.print(indent + 2);
-                    println!(",");
-                }
-                print_indent(indent + 1);
-                println!("],");
-                print_indent(indent);
-                print!("}}");
-            }
-            Ast::Index { arr, idx } => {
-                println!("Index {{");
-                print_indent(indent + 1);
-                print!("arr: ");
-                arr.print(indent + 1);
-                println!(",");
-                print_indent(indent + 1);
-                print!("idx: ");
-                idx.print(indent + 1);
-                println!(",");
-                print_indent(indent);
-                print!("}}");
-            }
-            Ast::Declare { var, val } => {
-                println!("Declare {{");
-                print_indent(indent + 1);
-                println!("var: {},", var);
-                print_indent(indent + 1);
-                print!("val: ");
-                if let Some(val) = val {
-                    val.print(indent + 1);
+                if cond {
+                    body.eval(variables)
+                } else if let Some(elze) = elze {
+                    elze.eval(variables)
                 } else {
-                    print!("None");
+                    Ok(Value::Unit)
                 }
-                println!(",");
-                print_indent(indent);
-                print!("}}");
-            }
-            Ast::Block(Block { exprs, ret }) => {
-                println!("Block {{");
-                print_indent(indent + 1);
-                println!("ret: {},", ret);
-                print_indent(indent + 1);
-                println!("exprs: [");
-                for a in exprs {
-                    print_indent(indent + 2);
-                    a.print(indent + 2);
-                    println!(",");
-                }
-                print_indent(indent + 1);
-                println!("],");
-                print_indent(indent);
-                print!("}}");
-            }
-            Ast::LambdaLit { args, block } => {
-                println!("LambdaLit {{");
-                print_indent(indent + 1);
-                println!("args: {:?},", args);
-                print_indent(indent + 1);
-                println!("ret: {},", block.ret);
-                print_indent(indent + 1);
-                println!("body: [");
-                for a in &block.exprs {
-                    print_indent(indent + 2);
-                    a.print(indent + 2);
-                    println!(",");
-                }
-                print_indent(indent + 1);
-                println!("],");
-                print_indent(indent);
-                print!("}}");
             }
         }
     }
@@ -650,6 +661,29 @@ where
         Some(exprs)
     }
 
+    fn parse_block(tokens: impl Iterator<Item = TokenTree>) -> Option<Block> {
+        let mut exprs = Vec::new();
+        let mut parser = Parser::new(tokens);
+        let mut ret = true;
+        while parser.lexer.peek().is_some() {
+            exprs.push(parser.parse_expr()?);
+            match parser.lexer.next() {
+                Some(TokenTree::Punct(Punct::Semicolon)) => {
+                    // if we get a semicolon as the last token, then we don't return a value
+                    if parser.lexer.peek().is_none() {
+                        ret = false;
+                        break;
+                    }
+                }
+                Some(tok) => panic!("Unexpected token: {:?}", tok),
+                None => break,
+            }
+        }
+        Some(Block { exprs, ret })
+    }
+
+    // TODO: literal numbers for bp is hard
+
     // returns ((), u8) to be clear it's a prefix
     fn prefix_bp(op: &TokenTree) -> Option<((), u8)> {
         match op {
@@ -661,8 +695,11 @@ where
     fn infix_bp(op: &TokenTree) -> Option<(u8, u8)> {
         match op {
             TokenTree::Punct(Punct::Eq) => Some((0, 1)),
-            TokenTree::Punct(Punct::Plus | Punct::Minus) => Some((2, 3)),
-            TokenTree::Punct(Punct::Star | Punct::Slash) => Some((4, 5)),
+            TokenTree::Punct(Punct::EqEq | Punct::Lt | Punct::Lte | Punct::Gte | Punct::Gt) => {
+                Some((2, 3))
+            }
+            TokenTree::Punct(Punct::Plus | Punct::Minus) => Some((4, 5)),
+            TokenTree::Punct(Punct::Star | Punct::Slash) => Some((6, 7)),
             _ => None,
         }
     }
@@ -688,7 +725,7 @@ where
                 Some(TokenTree::Punct(Punct::FatArrow)) => {
                     self.lexer.next().expect("peeked above");
                     let mut args = Vec::new();
-                    let mut parser = Parser::new(tokens.iter().cloned());
+                    let mut parser = Parser::new(tokens.into_iter());
                     while let Some(tt) = parser.lexer.next() {
                         let ident = match tt {
                             TokenTree::Ident(ident) => ident,
@@ -713,7 +750,7 @@ where
                     }
                 }
                 _ => {
-                    let mut p = Parser::new(tokens.iter().cloned());
+                    let mut p = Parser::new(tokens.into_iter());
                     p.parse_expr()?
                 }
             },
@@ -721,32 +758,13 @@ where
                 delim: GroupDelim::Bracket,
                 tokens,
             } => {
-                let exprs = Self::parse_comma_sep_exprs(tokens.iter().cloned())?;
+                let exprs = Self::parse_comma_sep_exprs(tokens.into_iter())?;
                 Ast::ArrayLit(exprs)
             }
             TokenTree::Group {
                 delim: GroupDelim::Brace,
                 tokens,
-            } => {
-                let mut exprs = Vec::new();
-                let mut parser = Parser::new(tokens.iter().cloned());
-                let mut ret = true;
-                while parser.lexer.peek().is_some() {
-                    exprs.push(parser.parse_expr()?);
-                    match parser.lexer.next() {
-                        Some(TokenTree::Punct(Punct::Semicolon)) => {
-                            // if we get a semicolon as the last token, then we don't return a value
-                            if parser.lexer.peek().is_none() {
-                                ret = false;
-                                break;
-                            }
-                        }
-                        Some(tok) => panic!("Unexpected token: {:?}", tok),
-                        None => break,
-                    }
-                }
-                Ast::Block(Block { exprs, ret })
-            }
+            } => Ast::Block(Self::parse_block(tokens.into_iter())?),
             TokenTree::Keyword(Keyword::Let) => {
                 let v = match self.lexer.next() {
                     Some(TokenTree::Ident(ident)) => ident,
@@ -770,7 +788,46 @@ where
                     None => panic!("Unexpected EOF"),
                 };
             }
-            tok @ (TokenTree::IntLit(_) | TokenTree::Ident(_)) => Ast::Atom(tok),
+            TokenTree::Keyword(Keyword::If) => {
+                let cond = self.parse_expr().unwrap();
+
+                let body = match self.lexer.next() {
+                    Some(TokenTree::Group {
+                        delim: GroupDelim::Brace,
+                        tokens,
+                    }) => Self::parse_block(tokens.into_iter())?,
+                    Some(tok) => panic!("Unexpected token: {:?}", tok),
+                    None => panic!("Unexpected EOF"),
+                };
+
+                let elze = if self
+                    .lexer
+                    .next_if_eq(&TokenTree::Keyword(Keyword::Else))
+                    .is_some()
+                {
+                    let body = match self.lexer.next() {
+                        Some(TokenTree::Group {
+                            delim: GroupDelim::Brace,
+                            tokens,
+                        }) => Self::parse_block(tokens.into_iter())?,
+                        Some(tok) => panic!("Unexpected token: {:?}", tok),
+                        None => panic!("Unexpected EOF"),
+                    };
+                    Some(body)
+                } else {
+                    None
+                };
+
+                Ast::If {
+                    cond: Box::new(cond),
+                    body,
+                    elze,
+                }
+            }
+            tok @ (TokenTree::IntLit(_)
+            | TokenTree::Ident(_)
+            | TokenTree::Keyword(Keyword::True)
+            | TokenTree::Keyword(Keyword::False)) => Ast::Atom(tok),
             tok if let Some(((), r_bp)) = Self::prefix_bp(&tok) => {
                 let rhs = self.parse_bp(r_bp)?;
                 Ast::PrefixOp {
@@ -807,13 +864,13 @@ where
                         tokens,
                     } => Ast::FunctionCall {
                         fun: Box::new(lhs),
-                        args: Self::parse_comma_sep_exprs(tokens.iter().cloned())?,
+                        args: Self::parse_comma_sep_exprs(tokens.into_iter())?,
                     },
                     TokenTree::Group {
                         delim: GroupDelim::Bracket,
                         tokens,
                     } => {
-                        let mut parser = Parser::new(tokens.iter().cloned());
+                        let mut parser = Parser::new(tokens.into_iter());
                         let idx = parser.parse_expr().unwrap();
 
                         Ast::Index {
@@ -846,6 +903,11 @@ where
                         TokenTree::Punct(Punct::Star) => InfixOp::Mul,
                         TokenTree::Punct(Punct::Slash) => InfixOp::Div,
                         TokenTree::Punct(Punct::Eq) => InfixOp::Assign,
+                        TokenTree::Punct(Punct::EqEq) => InfixOp::Equality,
+                        TokenTree::Punct(Punct::Lt) => InfixOp::Cmp(Cmp::Less),
+                        TokenTree::Punct(Punct::Lte) => InfixOp::Cmp(Cmp::LessOrEq),
+                        TokenTree::Punct(Punct::Gte) => InfixOp::Cmp(Cmp::GreaterOrEq),
+                        TokenTree::Punct(Punct::Gt) => InfixOp::Cmp(Cmp::Greater),
                         _ => unreachable!(),
                     },
                     operands: Box::new((lhs, rhs)),
@@ -853,7 +915,7 @@ where
                 continue;
             }
 
-            unreachable!();
+            break;
         }
 
         Some(lhs)
@@ -901,8 +963,7 @@ fn main() {
 
         while parser.lexer.peek().is_some() {
             let e = parser.parse_expr().unwrap();
-            print!("AST: ");
-            e.print(0);
+            print!("AST: {:?}", e);
             println!("\n");
             match e.eval(&mut variables) {
                 Ok(v) => println!("=> {}", v),
