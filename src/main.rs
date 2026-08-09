@@ -162,7 +162,7 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Option<TokenTree> {
         self.skip_whitespace();
 
-        Some(match self.take_char()? {
+        let tt = match self.take_char()? {
             c @ ('a'..='z' | 'A'..='Z' | '_') => {
                 self.untake_char(c);
                 let ident = self.take_ident();
@@ -175,6 +175,11 @@ impl<'a> Lexer<'a> {
             '+' => TokenTree::Punct(Punct::Plus),
             '-' => TokenTree::Punct(Punct::Minus),
             '*' => TokenTree::Punct(Punct::Star),
+            '/' if self.peek_char() == Some('/') => {
+                let rest = &self.content[self.position..];
+                self.position += rest.find('\n').unwrap_or(rest.len());
+                self.next_token()?
+            }
             '/' => TokenTree::Punct(Punct::Slash),
             '!' => TokenTree::Punct(Punct::Bang),
             ',' => TokenTree::Punct(Punct::Comma),
@@ -222,7 +227,8 @@ impl<'a> Lexer<'a> {
                 self.untake_char(c);
                 panic!("Unexpected character: {:?}", c)
             }
-        })
+        };
+        Some(tt)
     }
 }
 
@@ -929,9 +935,8 @@ where
 fn main() {
     print!("> ");
     let mut variables: HashMap<String, Value> = HashMap::from_iter([
-        //
         (
-            "print".to_string(),
+            "print".into(),
             Value::NativeFn(|a| {
                 for (i, a) in a.iter().enumerate() {
                     if i > 0 {
@@ -943,6 +948,7 @@ fn main() {
                 Value::Unit
             }),
         ),
+        ("debug".into(), Value::Bool(true)),
     ]);
     std::io::stdout().flush().unwrap();
     for l in std::io::stdin().lines() {
@@ -952,10 +958,17 @@ fn main() {
             std::io::stdout().flush().unwrap();
             continue;
         }
-        let lex = Lexer::new(&l);
-        println!("Token Trees:");
-        for t in lex {
-            println!("    {:?}", t);
+
+        let debug = variables
+            .get("debug")
+            .is_some_and(|v| *v == Value::Bool(true));
+
+        if debug {
+            let lex = Lexer::new(&l);
+            println!("Token Trees:");
+            for t in lex {
+                println!("    {:?}", t);
+            }
         }
 
         let lex = Lexer::new(&l);
@@ -963,8 +976,10 @@ fn main() {
 
         while parser.lexer.peek().is_some() {
             let e = parser.parse_expr().unwrap();
-            print!("AST: {:?}", e);
-            println!("\n");
+            if debug {
+                print!("AST: {:?}", e);
+                println!("\n");
+            }
             match e.eval(&mut variables) {
                 Ok(v) => println!("=> {}", v),
                 Err(e) => {
