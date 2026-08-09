@@ -1,37 +1,30 @@
-use std::{
-    fmt::Display,
-    io::{BufRead, Write},
-    iter::Peekable,
-};
+use std::{fmt::Display, io::Write, iter::Peekable};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Token {
-    Ident(String),
-    IntLit(u32),
+enum Punct {
     Plus,
     Minus,
     Star,
     Slash,
     Bang,
-    LParen,
-    RParen,
     Comma,
 }
 
-impl Token {
+impl Punct {
     fn is_op(&self) -> bool {
         match self {
-            Token::Ident(_) | Token::IntLit(_) => false,
-            Token::Plus
-            | Token::Minus
-            | Token::Star
-            | Token::Slash
-            | Token::Bang
-            | Token::LParen
-            | Token::RParen
-            | Token::Comma => true,
+            Punct::Plus | Punct::Minus | Punct::Star | Punct::Slash | Punct::Bang => true,
+            Punct::Comma => false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenTree {
+    Ident(String),
+    IntLit(u32),
+    Punct(Punct),
+    ParenGroup { tokens: Vec<TokenTree> },
 }
 
 #[derive(Debug, Clone)]
@@ -53,12 +46,12 @@ impl<'a> Lexer<'a> {
             self.content[self.position..].len() - self.content[self.position..].trim_start().len();
     }
 
-    fn peek_char(&self) -> Option<char> {
+    fn peek_char(&mut self) -> Option<char> {
         self.content[self.position..].chars().next()
     }
 
     fn take_char(&mut self) -> Option<char> {
-        let c = self.content[self.position..].chars().next()?;
+        let c = self.peek_char()?;
         self.position += c.len_utf8();
         Some(c)
     }
@@ -68,7 +61,7 @@ impl<'a> Lexer<'a> {
         assert_eq!(self.peek_char(), Some(c));
     }
 
-    fn take_number(&mut self) -> Token {
+    fn take_number(&mut self) -> TokenTree {
         let rest = &self.content[self.position..];
         let idx = rest
             .find(|c: char| !c.is_ascii_digit())
@@ -76,7 +69,7 @@ impl<'a> Lexer<'a> {
         self.position += idx;
         let num = &rest[..idx];
         let num = num.parse::<u32>().expect("TODO");
-        Token::IntLit(num)
+        TokenTree::IntLit(num)
     }
 
     fn take_ident(&mut self) -> &'a str {
@@ -88,22 +81,36 @@ impl<'a> Lexer<'a> {
         &rest[..idx]
     }
 
-    fn next_token(&mut self) -> Option<Token> {
+    fn take_group(&mut self, end: char) -> Option<Vec<TokenTree>> {
+        let mut out = Vec::new();
+        loop {
+            let next = self.take_char()?;
+            if next == end {
+                break;
+            }
+            self.untake_char(next);
+            out.push(self.next_token()?);
+        }
+        Some(out)
+    }
+
+    fn next_token(&mut self) -> Option<TokenTree> {
         self.skip_whitespace();
 
         Some(match self.take_char()? {
             c @ ('a'..='z' | 'A'..='Z') => {
                 self.untake_char(c);
-                Token::Ident(self.take_ident().into())
+                TokenTree::Ident(self.take_ident().into())
             }
-            '+' => Token::Plus,
-            '-' => Token::Minus,
-            '*' => Token::Star,
-            '/' => Token::Slash,
-            '!' => Token::Bang,
-            '(' => Token::LParen,
-            ')' => Token::RParen,
-            ',' => Token::Comma,
+            '+' => TokenTree::Punct(Punct::Plus),
+            '-' => TokenTree::Punct(Punct::Minus),
+            '*' => TokenTree::Punct(Punct::Star),
+            '/' => TokenTree::Punct(Punct::Slash),
+            '!' => TokenTree::Punct(Punct::Bang),
+            ',' => TokenTree::Punct(Punct::Comma),
+            '(' => TokenTree::ParenGroup {
+                tokens: self.take_group(')')?,
+            },
             c @ '0'..='9' => {
                 self.untake_char(c);
                 self.take_number()
@@ -117,26 +124,44 @@ impl<'a> Lexer<'a> {
 }
 
 impl<'a> Iterator for Lexer<'a> {
-    type Item = Token;
+    type Item = TokenTree;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_token()
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PrefixOp {
+    Neg,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PostfixOp {
+    Factorial,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InfixOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 #[derive(Debug, Clone)]
 enum Ast {
-    Atom(Token),
+    Atom(TokenTree),
     PrefixOp {
-        op: Token,
+        op: PrefixOp,
         operand: Box<Ast>,
     },
     PostfixOp {
-        op: Token,
+        op: PostfixOp,
         operand: Box<Ast>,
     },
     BinOp {
-        op: Token,
+        op: InfixOp,
         operands: Box<(Ast, Ast)>,
     },
     FunctionCall {
@@ -169,17 +194,15 @@ impl Ast {
     fn eval(&self) -> i32 {
         let v = match self {
             Ast::Atom(token) => match token {
-                Token::Ident(_) => todo!(),
-                Token::IntLit(n) => *n as _,
+                TokenTree::Ident(_) => todo!(),
+                TokenTree::IntLit(n) => *n as _,
                 _ => unreachable!(),
             },
             Ast::PrefixOp { op, operand } => match op {
-                Token::Plus => operand.eval(),
-                Token::Minus => -operand.eval(),
-                _ => unreachable!(),
+                PrefixOp::Neg => -operand.eval(),
             },
             Ast::PostfixOp { op, operand } => match op {
-                Token::Bang => {
+                PostfixOp::Factorial => {
                     let n = operand.eval();
                     if n <= 0 {
                         return 1;
@@ -190,14 +213,12 @@ impl Ast {
                     }
                     out
                 }
-                _ => unreachable!(),
             },
             Ast::BinOp { op, operands } => match op {
-                Token::Plus => operands.0.eval() + operands.1.eval(),
-                Token::Minus => operands.0.eval() - operands.1.eval(),
-                Token::Star => operands.0.eval() * operands.1.eval(),
-                Token::Slash => operands.0.eval() / operands.1.eval(),
-                _ => unreachable!(),
+                InfixOp::Add => operands.0.eval() + operands.1.eval(),
+                InfixOp::Sub => operands.0.eval() - operands.1.eval(),
+                InfixOp::Mul => operands.0.eval() * operands.1.eval(),
+                InfixOp::Div => operands.0.eval() / operands.1.eval(),
             },
             Ast::FunctionCall { fun, args } => todo!(),
         };
@@ -207,55 +228,58 @@ impl Ast {
 }
 
 #[derive(Debug, Clone)]
-struct Parser<'a> {
-    lexer: Peekable<Lexer<'a>>,
+struct Parser<I: Iterator<Item = TokenTree>> {
+    lexer: Peekable<I>,
 }
 
-impl<'a> Parser<'a> {
-    fn new(lexer: Lexer<'a>) -> Self {
+impl<I> Parser<I>
+where
+    I: Iterator<Item = TokenTree>,
+{
+    fn new(lexer: I) -> Self {
         Self {
             lexer: lexer.peekable(),
         }
     }
 
     // returns ((), u8) to be clear it's a prefix
-    fn prefix_bp(op: &Token) -> Option<((), u8)> {
+    fn prefix_bp(op: &TokenTree) -> Option<((), u8)> {
         match op {
-            Token::Plus | Token::Minus => Some(((), 5)),
+            TokenTree::Punct(Punct::Plus | Punct::Minus) => Some(((), 5)),
             _ => None,
         }
     }
 
-    fn infix_bp(op: &Token) -> Option<(u8, u8)> {
+    fn infix_bp(op: &TokenTree) -> Option<(u8, u8)> {
         match op {
-            Token::Plus | Token::Minus => Some((1, 2)),
-            Token::Star | Token::Slash => Some((3, 4)),
+            TokenTree::Punct(Punct::Plus | Punct::Minus) => Some((1, 2)),
+            TokenTree::Punct(Punct::Star | Punct::Slash) => Some((3, 4)),
             _ => None,
         }
     }
 
     // returns (u8, ()) to be clear it's a postfix
-    fn postfix_bp(op: &Token) -> Option<(u8, ())> {
+    fn postfix_bp(op: &TokenTree) -> Option<(u8, ())> {
         match op {
-            Token::Bang | Token::LParen => Some((7, ())),
+            TokenTree::Punct(Punct::Bang) => Some((7, ())),
             _ => None,
         }
     }
 
     fn parse_bp(&mut self, min_bp: u8) -> Option<Ast> {
         let mut lhs = match self.lexer.next()? {
-            Token::LParen => {
-                let lhs = self.parse_expr()?;
-                assert_eq!(self.lexer.next(), Some(Token::RParen));
-                lhs
+            TokenTree::ParenGroup { tokens } => {
+                let mut p = Parser::new(tokens.iter().cloned());
+                p.parse_expr()?
             }
-            tok @ (Token::IntLit(_) | Token::Ident(_)) => Ast::Atom(tok),
-            tok @ (Token::Plus | Token::Minus | Token::Star | Token::Slash)
-                if let Some(((), r_bp)) = Self::prefix_bp(&tok) =>
-            {
+            tok @ (TokenTree::IntLit(_) | TokenTree::Ident(_)) => Ast::Atom(tok),
+            tok if let Some(((), r_bp)) = Self::prefix_bp(&tok) => {
                 let rhs = self.parse_bp(r_bp)?;
                 Ast::PrefixOp {
-                    op: tok,
+                    op: match tok {
+                        TokenTree::Punct(Punct::Minus) => PrefixOp::Neg,
+                        _ => unreachable!(),
+                    },
                     operand: Box::new(rhs),
                 }
             }
@@ -265,10 +289,10 @@ impl<'a> Parser<'a> {
         loop {
             let op = match self.lexer.peek() {
                 None => break,
-                Some(Token::RParen | Token::Comma) => {
+                Some(TokenTree::Punct(Punct::Comma)) => {
                     break;
                 }
-                Some(tok) if tok.is_op() => tok,
+                Some(tok @ TokenTree::Punct(p)) if p.is_op() => tok,
                 tok => panic!("Unexpected token: {:?}", tok),
             };
 
@@ -278,29 +302,33 @@ impl<'a> Parser<'a> {
                 }
                 let op = self.lexer.next().expect("checked above");
 
-                if op == Token::LParen {
-                    let mut args = Vec::new();
-                    while let Some(peek) = self.lexer.peek()
-                        && *peek != Token::RParen
-                    {
-                        args.push(self.parse_expr()?);
-                        match self.lexer.next() {
-                            Some(Token::Comma) => continue,
-                            Some(Token::RParen) => break,
-                            Some(tok) => panic!("Unexpected token: {:?}", tok),
-                            None => panic!("Unexpected EOF"),
+                match op {
+                    TokenTree::ParenGroup { tokens } => {
+                        let mut args = Vec::new();
+                        let mut parser = Parser::new(tokens.iter().cloned());
+                        while parser.lexer.peek().is_some() {
+                            args.push(self.parse_expr()?);
+                            match self.lexer.next() {
+                                Some(TokenTree::Punct(Punct::Comma)) => continue,
+                                Some(tok) => panic!("Unexpected token: {:?}", tok),
+                                None => break,
+                            }
                         }
-                    }
 
-                    lhs = Ast::FunctionCall {
-                        fun: Box::new(lhs),
-                        args,
-                    };
-                } else {
-                    lhs = Ast::PostfixOp {
-                        op,
-                        operand: Box::new(lhs),
-                    };
+                        lhs = Ast::FunctionCall {
+                            fun: Box::new(lhs),
+                            args,
+                        };
+                    }
+                    _ => {
+                        lhs = Ast::PostfixOp {
+                            op: match op {
+                                TokenTree::Punct(Punct::Bang) => PostfixOp::Factorial,
+                                _ => unreachable!(),
+                            },
+                            operand: Box::new(lhs),
+                        };
+                    }
                 }
                 continue;
             }
@@ -313,7 +341,13 @@ impl<'a> Parser<'a> {
                 let op = self.lexer.next().expect("checked above"); // take the peeked item
                 let rhs = self.parse_bp(r_bp)?;
                 lhs = Ast::BinOp {
-                    op,
+                    op: match op {
+                        TokenTree::Punct(Punct::Plus) => InfixOp::Add,
+                        TokenTree::Punct(Punct::Minus) => InfixOp::Sub,
+                        TokenTree::Punct(Punct::Star) => InfixOp::Mul,
+                        TokenTree::Punct(Punct::Slash) => InfixOp::Div,
+                        _ => unreachable!(),
+                    },
                     operands: Box::new((lhs, rhs)),
                 };
                 continue;
@@ -336,10 +370,16 @@ fn main() {
     for l in std::io::stdin().lines() {
         let l = l.unwrap();
         let lex = Lexer::new(&l);
+        println!("Token Trees:");
+        for t in lex {
+            println!("  {:?}", t);
+        }
+
+        let lex = Lexer::new(&l);
         let mut parser = Parser::new(lex);
 
         let e = parser.parse_expr().unwrap();
-        println!("{}", e);
+        println!("AST: {}", e);
         println!("{}", e.eval());
         print!("> ");
         std::io::stdout().flush().unwrap();
