@@ -1,4 +1,4 @@
-use std::{fmt::Display, io::Write, iter::Peekable};
+use std::{collections::HashMap, fmt::Display, io::Write, iter::Peekable};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Punct {
@@ -20,11 +20,22 @@ impl Punct {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum GroupDelim {
+    /// `()`
+    Paren,
+    /// `[]`
+    Bracket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenTree {
     Ident(String),
     IntLit(u32),
     Punct(Punct),
-    ParenGroup { tokens: Vec<TokenTree> },
+    Group {
+        delim: GroupDelim,
+        tokens: Vec<TokenTree>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -108,8 +119,13 @@ impl<'a> Lexer<'a> {
             '/' => TokenTree::Punct(Punct::Slash),
             '!' => TokenTree::Punct(Punct::Bang),
             ',' => TokenTree::Punct(Punct::Comma),
-            '(' => TokenTree::ParenGroup {
+            '(' => TokenTree::Group {
+                delim: GroupDelim::Paren,
                 tokens: self.take_group(')')?,
+            },
+            '[' => TokenTree::Group {
+                delim: GroupDelim::Bracket,
+                tokens: self.take_group(']')?,
             },
             c @ '0'..='9' => {
                 self.untake_char(c);
@@ -131,17 +147,17 @@ impl<'a> Iterator for Lexer<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrefixOp {
     Neg,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostfixOp {
     Factorial,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InfixOp {
     Add,
     Sub,
@@ -149,9 +165,10 @@ enum InfixOp {
     Div,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Ast {
     Atom(TokenTree),
+    ArrayLit(Vec<Ast>),
     PrefixOp {
         op: PrefixOp,
         operand: Box<Ast>,
@@ -168,12 +185,23 @@ enum Ast {
         fun: Box<Ast>,
         args: Vec<Ast>,
     },
+    Index {
+        arr: Box<Ast>,
+        idx: Box<Ast>,
+    },
 }
 
 impl Display for Ast {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ast::Atom(token) => write!(f, "{:?}", token),
+            Ast::ArrayLit(items) => {
+                write!(f, "(<arr>")?;
+                for a in items {
+                    write!(f, " {}", a)?;
+                }
+                write!(f, ")")
+            }
             Ast::PrefixOp { op, operand } => write!(f, "(<pre>{:?} {})", op, operand),
             Ast::PostfixOp { op, operand } => write!(f, "(<post>{:?} {})", op, operand),
             Ast::BinOp { op, operands } => {
@@ -186,47 +214,224 @@ impl Display for Ast {
                 }
                 write!(f, ")")
             }
+            Ast::Index { arr, idx } => {
+                write!(f, "(<idx>{} {})", arr, idx)
+            }
         }
     }
 }
 
+#[allow(unpredictable_function_pointer_comparisons)] // not really important here
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Value {
+    #[default]
+    Unit,
+    Integer(i32),
+    Function(fn(&[Value]) -> Value),
+    Array(Vec<Value>),
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Unit => write!(f, "()"),
+            Value::Integer(n) => write!(f, "{}", n),
+            Value::Function(fun) => write!(f, "<function {:?}>", fun),
+            Value::Array(a) => {
+                write!(f, "[")?;
+                for (i, a) in a.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", a)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum EvalError {
+    ExpectedInt(Value),
+    ExpectedArray(Value),
+    ExpectedFunction(Value),
+    OutOfBounds { max: usize, idx: i32 },
+    UndefinedVariable(String),
+}
+
 impl Ast {
-    fn eval(&self) -> i32 {
+    fn eval(&self, variables: &mut HashMap<String, Value>) -> Result<Value, EvalError> {
         match self {
             Ast::Atom(token) => match token {
-                TokenTree::Ident(_) => todo!(),
-                TokenTree::IntLit(n) => *n as _,
+                TokenTree::Ident(ident) => variables
+                    .get(ident)
+                    .ok_or_else(|| EvalError::UndefinedVariable(ident.clone()))
+                    .cloned(),
+                TokenTree::IntLit(n) => Ok(Value::Integer(*n as _)),
                 _ => unreachable!(),
             },
+            Ast::ArrayLit(items) => {
+                let mut items2 = Vec::with_capacity(items.len());
+                for i in items {
+                    items2.push(i.eval(variables)?);
+                }
+                Ok(Value::Array(items2))
+            }
             Ast::PrefixOp { op, operand } => match op {
-                PrefixOp::Neg => -operand.eval(),
+                PrefixOp::Neg => match operand.eval(variables)? {
+                    Value::Integer(n) => Ok(Value::Integer(n as _)),
+                    v => Err(EvalError::ExpectedInt(v)),
+                },
             },
             Ast::PostfixOp { op, operand } => match op {
                 PostfixOp::Factorial => {
-                    let n = operand.eval();
-                    if n <= 0 {
-                        return 1;
-                    }
+                    let n = match operand.eval(variables)? {
+                        Value::Integer(n) => n,
+                        v => return Err(EvalError::ExpectedInt(v)),
+                    };
+
                     let mut out = 1;
                     for i in 1..=n {
                         out *= i;
                     }
-                    out
+                    Ok(Value::Integer(out))
                 }
             },
-            Ast::BinOp { op, operands } => match op {
-                InfixOp::Add => operands.0.eval() + operands.1.eval(),
-                InfixOp::Sub => operands.0.eval() - operands.1.eval(),
-                InfixOp::Mul => operands.0.eval() * operands.1.eval(),
-                InfixOp::Div => operands.0.eval() / operands.1.eval(),
-            },
-            Ast::FunctionCall { fun, args } => match **fun {
-                Ast::Atom(TokenTree::Ident(ref n)) if n == "dbg" => {
-                    println!("dbg: {:?}", args);
-                    args.first().map(Ast::eval).unwrap_or_default()
+            Ast::BinOp { op, operands } => {
+                let lhs = match operands.0.eval(variables)? {
+                    Value::Integer(n) => n,
+                    v => return Err(EvalError::ExpectedInt(v)),
+                };
+                let rhs = match operands.1.eval(variables)? {
+                    Value::Integer(n) => n,
+                    v => return Err(EvalError::ExpectedInt(v)),
+                };
+                let n = match op {
+                    InfixOp::Add => lhs + rhs,
+                    InfixOp::Sub => lhs - rhs,
+                    InfixOp::Mul => lhs * rhs,
+                    InfixOp::Div => lhs / rhs,
+                };
+                Ok(Value::Integer(n))
+            }
+            Ast::FunctionCall { fun, args } => {
+                let fun = match fun.eval(variables)? {
+                    Value::Function(fun) => fun,
+                    v => return Err(EvalError::ExpectedFunction(v)),
+                };
+
+                let mut args2 = Vec::with_capacity(args.len());
+                for i in args {
+                    args2.push(i.eval(variables)?);
                 }
-                _ => todo!(),
-            },
+
+                Ok(fun(&args2))
+            }
+            Ast::Index { arr, idx } => {
+                let arr = match arr.eval(variables)? {
+                    Value::Array(arr) => arr,
+                    v => return Err(EvalError::ExpectedArray(v)),
+                };
+                let idx = match idx.eval(variables)? {
+                    Value::Integer(n) => n,
+                    v => return Err(EvalError::ExpectedInt(v)),
+                };
+
+                arr.get(idx as usize)
+                    .ok_or(EvalError::OutOfBounds {
+                        max: arr.len(),
+                        idx,
+                    })
+                    .cloned()
+            }
+        }
+    }
+
+    fn print(&self, indent: usize) {
+        fn print_indent(indent: usize) {
+            print!("{:>gap$}", "", gap = indent * 4);
+        }
+        match self {
+            Ast::Atom(token_tree) => print!("{:?}", token_tree),
+            Ast::ArrayLit(asts) => {
+                println!("ArrayLit [");
+                for a in asts {
+                    print_indent(indent + 1);
+                    a.print(indent + 1);
+                    println!(",");
+                }
+                print_indent(indent);
+                print!("]");
+            }
+            Ast::PrefixOp { op, operand } => {
+                println!("PrefixOp {{");
+                print_indent(indent + 1);
+                println!("op: {:?},", op);
+                print_indent(indent + 1);
+                print!("operand: ");
+                operand.print(indent + 1);
+                println!(",");
+                print_indent(indent);
+                print!("}}");
+            }
+            Ast::PostfixOp { op, operand } => {
+                println!("PostfixOp {{");
+                print_indent(indent + 1);
+                println!("op: {:?},", op);
+                print_indent(indent + 1);
+                print!("operand: ");
+                operand.print(indent + 1);
+                println!(",");
+                print_indent(indent);
+                print!("}}");
+            }
+            Ast::BinOp { op, operands } => {
+                println!("BinOp {{");
+                print_indent(indent + 1);
+                println!("op: {:?},", op);
+                print_indent(indent + 1);
+                print!("lhs: ");
+                operands.0.print(indent + 1);
+                println!(",");
+                print_indent(indent + 1);
+                print!("rhs: ");
+                operands.1.print(indent + 1);
+                println!(",");
+                print_indent(indent);
+                print!("}}");
+            }
+            Ast::FunctionCall { fun, args } => {
+                println!("FunctionCall {{");
+                print_indent(indent + 1);
+                print!("fun: ");
+                fun.print(indent + 1);
+                println!(",");
+                print_indent(indent + 1);
+                println!("args: [");
+                for a in args {
+                    print_indent(indent + 2);
+                    a.print(indent + 2);
+                    println!(",");
+                }
+                print_indent(indent + 1);
+                println!("],");
+                print_indent(indent);
+                print!("}}");
+            }
+            Ast::Index { arr, idx } => {
+                println!("Index {{");
+                print_indent(indent + 1);
+                print!("arr: ");
+                arr.print(indent + 1);
+                println!(",");
+                print_indent(indent + 1);
+                print!("idx: ");
+                idx.print(indent + 1);
+                println!(",");
+                print_indent(indent);
+                print!("}}");
+            }
         }
     }
 }
@@ -244,6 +449,20 @@ where
         Self {
             lexer: lexer.peekable(),
         }
+    }
+
+    fn parse_comma_sep_exprs(tokens: impl Iterator<Item = TokenTree>) -> Option<Vec<Ast>> {
+        let mut exprs = Vec::new();
+        let mut parser = Parser::new(tokens);
+        while parser.lexer.peek().is_some() {
+            exprs.push(parser.parse_expr()?);
+            match parser.lexer.next() {
+                Some(TokenTree::Punct(Punct::Comma)) => continue,
+                Some(tok) => panic!("Unexpected token: {:?}", tok),
+                None => break,
+            }
+        }
+        Some(exprs)
     }
 
     // returns ((), u8) to be clear it's a prefix
@@ -265,16 +484,30 @@ where
     // returns (u8, ()) to be clear it's a postfix
     fn postfix_bp(op: &TokenTree) -> Option<(u8, ())> {
         match op {
-            TokenTree::Punct(Punct::Bang) | TokenTree::ParenGroup { .. } => Some((7, ())),
+            TokenTree::Punct(Punct::Bang)
+            | TokenTree::Group {
+                delim: GroupDelim::Paren | GroupDelim::Bracket,
+                ..
+            } => Some((7, ())),
             _ => None,
         }
     }
 
     fn parse_bp(&mut self, min_bp: u8) -> Option<Ast> {
         let mut lhs = match self.lexer.next()? {
-            TokenTree::ParenGroup { tokens } => {
+            TokenTree::Group {
+                delim: GroupDelim::Paren,
+                tokens,
+            } => {
                 let mut p = Parser::new(tokens.iter().cloned());
                 p.parse_expr()?
+            }
+            TokenTree::Group {
+                delim: GroupDelim::Bracket,
+                tokens,
+            } => {
+                let exprs = Self::parse_comma_sep_exprs(tokens.iter().cloned())?;
+                Ast::ArrayLit(exprs)
             }
             tok @ (TokenTree::IntLit(_) | TokenTree::Ident(_)) => Ast::Atom(tok),
             tok if let Some(((), r_bp)) = Self::prefix_bp(&tok) => {
@@ -297,7 +530,7 @@ where
                     break;
                 }
                 Some(tok @ TokenTree::Punct(p)) if p.is_op() => tok,
-                Some(tok @ TokenTree::ParenGroup { .. }) => tok,
+                Some(tok @ TokenTree::Group { .. }) => tok,
                 tok => panic!("Unexpected token: {:?}", tok),
             };
 
@@ -307,34 +540,34 @@ where
                 }
                 let op = self.lexer.next().expect("checked above");
 
-                match op {
-                    TokenTree::ParenGroup { tokens } => {
-                        let mut args = Vec::new();
+                lhs = match op {
+                    TokenTree::Group {
+                        delim: GroupDelim::Paren,
+                        tokens,
+                    } => Ast::FunctionCall {
+                        fun: Box::new(lhs),
+                        args: Self::parse_comma_sep_exprs(tokens.iter().cloned())?,
+                    },
+                    TokenTree::Group {
+                        delim: GroupDelim::Bracket,
+                        tokens,
+                    } => {
                         let mut parser = Parser::new(tokens.iter().cloned());
-                        while parser.lexer.peek().is_some() {
-                            args.push(parser.parse_expr().unwrap());
-                            match self.lexer.next() {
-                                Some(TokenTree::Punct(Punct::Comma)) => continue,
-                                Some(tok) => panic!("Unexpected token: {:?}", tok),
-                                None => break,
-                            }
-                        }
+                        let idx = parser.parse_expr().unwrap();
 
-                        lhs = Ast::FunctionCall {
-                            fun: Box::new(lhs),
-                            args,
-                        };
+                        Ast::Index {
+                            arr: Box::new(lhs),
+                            idx: Box::new(idx),
+                        }
                     }
-                    _ => {
-                        lhs = Ast::PostfixOp {
-                            op: match op {
-                                TokenTree::Punct(Punct::Bang) => PostfixOp::Factorial,
-                                _ => unreachable!(),
-                            },
-                            operand: Box::new(lhs),
-                        };
-                    }
-                }
+                    _ => Ast::PostfixOp {
+                        op: match op {
+                            TokenTree::Punct(Punct::Bang) => PostfixOp::Factorial,
+                            _ => unreachable!(),
+                        },
+                        operand: Box::new(lhs),
+                    },
+                };
                 continue;
             }
 
@@ -371,9 +604,30 @@ where
 
 fn main() {
     print!("> ");
+    let mut variables = HashMap::<String, Value>::from_iter([
+        //
+        (
+            "print".to_string(),
+            Value::Function(|a| {
+                for (i, a) in a.iter().enumerate() {
+                    if i > 0 {
+                        print!(" ");
+                    }
+                    print!("{}", a);
+                }
+                println!();
+                Value::Unit
+            }),
+        ),
+    ]);
     std::io::stdout().flush().unwrap();
     for l in std::io::stdin().lines() {
         let l = l.unwrap();
+        if l.trim().is_empty() {
+            print!("> ");
+            std::io::stdout().flush().unwrap();
+            continue;
+        }
         let lex = Lexer::new(&l);
         println!("Token Trees:");
         for t in lex {
@@ -384,9 +638,233 @@ fn main() {
         let mut parser = Parser::new(lex);
 
         let e = parser.parse_expr().unwrap();
-        println!("AST: {}", e);
-        println!("{}", e.eval());
+        println!("AST:");
+        e.print(0);
+        println!();
+        match e.eval(&mut variables) {
+            Ok(v) => println!("{}", v),
+            Err(e) => println!("ERROR: {:?}", e),
+        }
         print!("> ");
         std::io::stdout().flush().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{Ast, GroupDelim, InfixOp, Lexer, Parser, Punct, TokenTree, Value};
+
+    #[test]
+    fn basic_lex() {
+        let s = "69 + - * / ! , foo";
+        let mut l = Lexer::new(s);
+
+        assert_eq!(l.next(), Some(TokenTree::IntLit(69)));
+        assert_eq!(l.next(), Some(TokenTree::Punct(Punct::Plus)));
+        assert_eq!(l.next(), Some(TokenTree::Punct(Punct::Minus)));
+        assert_eq!(l.next(), Some(TokenTree::Punct(Punct::Star)));
+        assert_eq!(l.next(), Some(TokenTree::Punct(Punct::Slash)));
+        assert_eq!(l.next(), Some(TokenTree::Punct(Punct::Bang)));
+        assert_eq!(l.next(), Some(TokenTree::Punct(Punct::Comma)));
+        assert_eq!(l.next(), Some(TokenTree::Ident("foo".into())));
+        assert_eq!(l.next(), None);
+    }
+
+    #[test]
+    fn tree_lex() {
+        let s = "(1 + 2)[7 * 6]";
+        let mut l = Lexer::new(s);
+
+        assert_eq!(
+            l.next(),
+            Some(TokenTree::Group {
+                delim: GroupDelim::Paren,
+                tokens: vec![
+                    TokenTree::IntLit(1),
+                    TokenTree::Punct(Punct::Plus),
+                    TokenTree::IntLit(2)
+                ]
+            })
+        );
+        assert_eq!(
+            l.next(),
+            Some(TokenTree::Group {
+                delim: GroupDelim::Bracket,
+                tokens: vec![
+                    TokenTree::IntLit(7),
+                    TokenTree::Punct(Punct::Star),
+                    TokenTree::IntLit(6)
+                ]
+            })
+        );
+        assert_eq!(l.next(), None);
+    }
+
+    #[test]
+    fn parse_left_to_right() {
+        let s = "1 + 2 + 3";
+        let mut l = Lexer::new(s);
+        let mut parser = Parser::new(&mut l);
+
+        // (1 + 2) + 3
+        let ast = parser.parse_expr().unwrap();
+        assert_eq!(
+            ast,
+            Ast::BinOp {
+                op: InfixOp::Add,
+                operands: Box::new((
+                    Ast::BinOp {
+                        op: InfixOp::Add,
+                        operands: Box::new((
+                            Ast::Atom(TokenTree::IntLit(1)),
+                            Ast::Atom(TokenTree::IntLit(2)),
+                        ))
+                    },
+                    Ast::Atom(TokenTree::IntLit(3)),
+                ))
+            }
+        );
+
+        assert_eq!(l.next(), None); // ensure we've gobbled all tokens
+    }
+
+    #[test]
+    fn parse_oop_left_to_right() {
+        let s = "1 * 2 + 3";
+        let mut l = Lexer::new(s);
+        let mut parser = Parser::new(&mut l);
+
+        // (1 * 2) + 3
+        let ast = parser.parse_expr().unwrap();
+        assert_eq!(
+            ast,
+            Ast::BinOp {
+                op: InfixOp::Add,
+                operands: Box::new((
+                    Ast::BinOp {
+                        op: InfixOp::Mul,
+                        operands: Box::new((
+                            Ast::Atom(TokenTree::IntLit(1)),
+                            Ast::Atom(TokenTree::IntLit(2)),
+                        ))
+                    },
+                    Ast::Atom(TokenTree::IntLit(3)),
+                ))
+            }
+        );
+
+        assert_eq!(l.next(), None); // ensure we've gobbled all tokens
+    }
+
+    #[test]
+    fn parse_oop_right_to_left() {
+        let s = "1 + 2 * 3";
+        let mut l = Lexer::new(s);
+        let mut parser = Parser::new(&mut l);
+
+        // 1 + (2 * 3)
+        let ast = parser.parse_expr().unwrap();
+        assert_eq!(
+            ast,
+            Ast::BinOp {
+                op: InfixOp::Add,
+                operands: Box::new((
+                    Ast::Atom(TokenTree::IntLit(1)),
+                    Ast::BinOp {
+                        op: InfixOp::Mul,
+                        operands: Box::new((
+                            Ast::Atom(TokenTree::IntLit(2)),
+                            Ast::Atom(TokenTree::IntLit(3)),
+                        ))
+                    },
+                ))
+            }
+        );
+
+        assert_eq!(l.next(), None); // ensure we've gobbled all tokens
+    }
+
+    #[test]
+    fn parse_function_call() {
+        let s = "foo(1 + 2, bar(3, 4), 5)";
+        let mut l = Lexer::new(s);
+        let mut parser = Parser::new(&mut l);
+
+        let ast = parser.parse_expr().unwrap();
+        assert_eq!(
+            ast,
+            Ast::FunctionCall {
+                fun: Box::new(Ast::Atom(TokenTree::Ident("foo".into()))),
+                args: vec![
+                    Ast::BinOp {
+                        op: InfixOp::Add,
+                        operands: Box::new((
+                            Ast::Atom(TokenTree::IntLit(1)),
+                            Ast::Atom(TokenTree::IntLit(2)),
+                        ))
+                    },
+                    Ast::FunctionCall {
+                        fun: Box::new(Ast::Atom(TokenTree::Ident("bar".into()))),
+                        args: vec![
+                            Ast::Atom(TokenTree::IntLit(3)),
+                            Ast::Atom(TokenTree::IntLit(4)),
+                        ],
+                    },
+                    Ast::Atom(TokenTree::IntLit(5)),
+                ]
+            }
+        );
+
+        assert_eq!(l.next(), None); // ensure we've gobbled all tokens
+    }
+
+    #[test]
+    fn eval_complex() {
+        let s = "1 + 2 * 3 / 4 + 6 * (3 + 2) + 4!";
+
+        fn factorial(n: i32) -> i32 {
+            let mut out = 1;
+            for i in 1..=n {
+                out *= i;
+            }
+            out
+        }
+
+        let mut l = Lexer::new(s);
+        let mut parser = Parser::new(&mut l);
+        let ast = parser.parse_expr().unwrap();
+        let result = ast.eval(&mut Default::default()).unwrap();
+        assert_eq!(
+            result,
+            Value::Integer(1 + 2 * 3 / 4 + 6 * (3 + 2) + factorial(4))
+        );
+    }
+
+    macro_rules! str_and_calc {
+        ($($tt: tt)*) => {
+            (stringify!($($tt)*), $($tt)*)
+        };
+    }
+
+    #[test]
+    fn eval_array() {
+        let (s, expected) = str_and_calc!([1, 2, 3][2]);
+
+        let mut l = Lexer::new(s);
+        let mut parser = Parser::new(&mut l);
+        let ast = parser.parse_expr().unwrap();
+        let result = ast.eval(&mut Default::default()).unwrap();
+        assert_eq!(result, Value::Integer(expected));
+    }
+
+    #[test]
+    fn eval_array_complex() {
+        let (s, expected) = str_and_calc!([3 + 4, 6 + 9, 4 + 2][7 * 6 / 21 - 1]);
+
+        let mut l = Lexer::new(s);
+        let mut parser = Parser::new(&mut l);
+        let ast = parser.parse_expr().unwrap();
+        let result = ast.eval(&mut Default::default()).unwrap();
+        assert_eq!(result, Value::Integer(expected));
     }
 }
