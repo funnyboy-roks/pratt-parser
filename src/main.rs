@@ -1040,7 +1040,7 @@ where
         let mut exprs = Vec::new();
         let mut parser = Parser::new(tokens);
         while parser.lexer.peek().is_some() {
-            exprs.push(parser.parse_expr()?);
+            exprs.push(parser.parse_bp(0)?);
             match parser.lexer.next() {
                 Some(TokenTree::Punct(Punct::Comma)) => continue,
                 Some(tok) => {
@@ -1057,7 +1057,7 @@ where
         let mut parser = Parser::new(tokens);
         let mut ret = true;
         while parser.lexer.peek().is_some() {
-            exprs.push(parser.parse_expr()?);
+            exprs.push(parser.parse_bp(0)?);
             match parser.lexer.next() {
                 Some(TokenTree::Punct(Punct::Semicolon)) => {
                     // if we get a semicolon as the last token, then we don't return a value
@@ -1152,7 +1152,7 @@ where
                     }
                     Ast::LambdaLit {
                         args,
-                        block: match self.parse_expr()? {
+                        block: match self.parse_bp(0)? {
                             Ast::Block(block) => block,
                             e => Block {
                                 exprs: vec![e],
@@ -1163,7 +1163,7 @@ where
                 }
                 _ => {
                     let mut p = Parser::new(tokens.into_iter());
-                    p.parse_expr()?
+                    p.parse_bp(0)?
                 }
             },
             TokenTree::Group {
@@ -1186,7 +1186,7 @@ where
                     }
                     Some(TokenTree::Punct(Punct::Eq)) => {
                         self.lexer.next().unwrap(); // munch eq
-                        let expr = self.parse_expr()?;
+                        let expr = self.parse_bp(0)?;
                         Ok(Ast::Declare {
                             var: v,
                             val: Some(Box::new(expr)),
@@ -1196,7 +1196,7 @@ where
                 };
             }
             TokenTree::Keyword(Keyword::If) => {
-                let cond = self.parse_expr().unwrap();
+                let cond = self.parse_bp(0).unwrap();
 
                 let body = match self.lexer.next() {
                     Some(TokenTree::Group {
@@ -1230,7 +1230,7 @@ where
                 }
             }
             TokenTree::Keyword(Keyword::While) => {
-                let cond = self.parse_expr().unwrap();
+                let cond = self.parse_bp(0).unwrap();
 
                 let body = match self.lexer.next() {
                     Some(TokenTree::Group {
@@ -1258,7 +1258,7 @@ where
                     tok => return Err(ParseError::unexpected("'in' or Comma", tok)),
                 };
 
-                let array = self.parse_expr()?;
+                let array = self.parse_bp(0)?;
 
                 let body = match self.lexer.next() {
                     Some(TokenTree::Group {
@@ -1300,7 +1300,12 @@ where
                 }
                 Some(tok @ TokenTree::Punct(p)) if p.is_op() => tok,
                 Some(tok @ TokenTree::Group { .. }) => tok,
-                tok => return Err(ParseError::unexpected("operator", tok.cloned())),
+                tok => {
+                    return Err(ParseError::unexpected(
+                        "operator or semicolon",
+                        tok.cloned(),
+                    ));
+                }
             };
 
             if let Some((l_bp, ())) = Self::postfix_bp(op) {
@@ -1329,7 +1334,7 @@ where
                         tokens,
                     } => {
                         let mut parser = Parser::new(tokens.into_iter());
-                        let idx = parser.parse_expr().unwrap();
+                        let idx = parser.parse_bp(0).unwrap();
 
                         Ast::Index {
                             arr: Box::new(lhs),
@@ -1390,11 +1395,19 @@ where
     }
 
     fn parse_expr(&mut self) -> Result<Ast, ParseError> {
-        self.parse_bp(0)
+        let ast = self.parse_bp(0)?;
+        while self
+            .lexer
+            .next_if_eq(&TokenTree::Punct(Punct::Semicolon))
+            .is_some()
+        {}
+        Ok(ast)
     }
 }
 
 fn main() {
+    let path = std::env::args().nth(1);
+
     let scope = Scope::new();
 
     scope.declare_var(
@@ -1411,6 +1424,20 @@ fn main() {
         })),
     );
     scope.declare_var("debug", Value::Bool(true));
+
+    if let Some(path) = path {
+        let content = std::fs::read_to_string(path).unwrap();
+        let lex = Lexer::new(&content);
+        let mut parser = Parser::new(lex);
+        while parser.lexer.peek().is_some() {
+            let e = parser.parse_expr().unwrap();
+            if let Err(e) = e.eval(scope.clone()) {
+                println!("ERROR: {:?}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     print!("> ");
     std::io::stdout().flush().unwrap();
@@ -1448,11 +1475,6 @@ fn main() {
                     break;
                 }
             }
-            while parser
-                .lexer
-                .next_if_eq(&TokenTree::Punct(Punct::Semicolon))
-                .is_some()
-            {}
         }
         print!("> ");
         std::io::stdout().flush().unwrap();
