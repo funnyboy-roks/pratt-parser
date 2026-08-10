@@ -12,6 +12,23 @@ use std::{
 #[cfg(test)]
 mod test;
 
+#[derive(Debug)]
+enum ControlFlow<B, V> {
+    Break(B),
+    Value(V),
+    Continue,
+}
+
+macro_rules! try_cf {
+    ($expr: expr) => {
+        match $expr {
+            ControlFlow::Break(v) => return Ok(ControlFlow::Break(v)),
+            ControlFlow::Value(v) => v,
+            ControlFlow::Continue => return Ok(ControlFlow::Continue),
+        }
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Keyword {
     Let,
@@ -22,6 +39,8 @@ enum Keyword {
     While,
     For,
     In,
+    Break,
+    Continue,
 }
 
 impl Keyword {
@@ -35,6 +54,8 @@ impl Keyword {
             "while" => Some(Self::While),
             "for" => Some(Self::For),
             "in" => Some(Self::In),
+            "break" => Some(Self::Break),
+            "continue" => Some(Self::Continue),
             _ => None,
         }
     }
@@ -400,16 +421,22 @@ impl Display for Block {
 }
 
 impl Block {
-    fn eval(&self, scope: Rc<Scope>) -> Result<ValueRef, EvalError> {
+    fn eval(
+        &self,
+        scope: Rc<Scope>,
+        in_loop: bool,
+        depth: usize,
+    ) -> Result<ControlFlow<ValueRef, ValueRef>, EvalError> {
         let mut last = Value::Unit.into();
         for e in &self.exprs {
-            last = e.eval(scope.clone())?;
+            last = try_cf!(e.eval_inner(scope.clone(), in_loop, depth + 1)?);
         }
         if self.ret {
             Ok(last)
         } else {
             Ok(Value::Unit.into())
         }
+        .map(ControlFlow::Value)
     }
 }
 
@@ -469,6 +496,8 @@ enum Ast {
         value: Box<Ast>,
         field: Rc<str>,
     },
+    Break(Option<Box<Ast>>),
+    Continue,
 }
 
 impl Display for Ast {
@@ -550,6 +579,16 @@ impl Display for Ast {
                 field,
             } => {
                 write!(f, "({}.{})", object, field)
+            }
+            Ast::Break(val) => {
+                if let Some(val) = val {
+                    write!(f, "(break {})", val)
+                } else {
+                    write!(f, "(break)")
+                }
+            }
+            Ast::Continue => {
+                write!(f, "continue")
             }
         }
     }
@@ -663,8 +702,14 @@ impl From<Vec<ValueRef>> for Value {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 struct ValueRef(Rc<RefCell<Value>>);
+
+impl Debug for ValueRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ValueRef").field(&self.0.borrow()).finish()
+    }
+}
 
 impl Display for ValueRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -733,10 +778,16 @@ enum EvalError {
     OutOfBounds { max: usize, idx: i32 },
     UndefinedVariable(Rc<str>),
     UnknownField(Value, Rc<str>),
+    UnexpectedBreak,
 }
 
 impl Ast {
-    fn eval(&self, scope: Rc<Scope>) -> Result<ValueRef, EvalError> {
+    fn eval_inner(
+        &self,
+        scope: Rc<Scope>,
+        in_loop: bool,
+        depth: usize,
+    ) -> Result<ControlFlow<ValueRef, ValueRef>, EvalError> {
         match self {
             Ast::Atom(token) => match token {
                 TokenTree::Ident(ident) => scope
@@ -750,19 +801,22 @@ impl Ast {
             Ast::ArrayLit(items) => {
                 let mut items2 = Vec::with_capacity(items.len());
                 for i in items {
-                    items2.push(i.eval(scope.clone())?);
+                    items2.push(try_cf!(i.eval_inner(scope.clone(), in_loop, depth + 1)?));
                 }
                 Ok(items2.into())
             }
             Ast::PrefixOp { op, operand } => match op {
-                PrefixOp::Neg => match &*operand.eval(scope)?.borrow() {
-                    Value::Integer(n) => Ok((-n).into()),
-                    v => Err(EvalError::ExpectedInt(v.clone())),
-                },
+                PrefixOp::Neg => {
+                    match &*try_cf!(operand.eval_inner(scope, in_loop, depth + 1)?).borrow() {
+                        Value::Integer(n) => Ok((-n).into()),
+                        v => Err(EvalError::ExpectedInt(v.clone())),
+                    }
+                }
             },
             Ast::PostfixOp { op, operand } => match op {
                 PostfixOp::Factorial => {
-                    let n = match &*operand.eval(scope)?.borrow() {
+                    let n = match &*try_cf!(operand.eval_inner(scope, in_loop, depth + 1)?).borrow()
+                    {
                         Value::Integer(n) => *n,
                         v => return Err(EvalError::ExpectedInt(v.clone())),
                     };
@@ -775,20 +829,29 @@ impl Ast {
                 }
             },
             Ast::BinOp { op, operands } => {
-                let int = |ast: &Ast| -> Result<i32, EvalError> {
-                    match &*ast.eval(scope.clone())?.borrow() {
-                        Value::Integer(n) => Ok(*n),
+                let int = |ast: &Ast| -> Result<ControlFlow<ValueRef, i32>, EvalError> {
+                    match &*try_cf!(ast.eval_inner(scope.clone(), in_loop, depth + 1)?).borrow() {
+                        Value::Integer(n) => Ok(ControlFlow::Value(*n)),
                         v => Err(EvalError::ExpectedInt(v.clone())),
                     }
                 };
+                macro_rules! op {
+                    ($op: tt) => {
+                        Ok((try_cf!(int(&operands.0)?) $op try_cf!(int(&operands.1)?)).into())
+                    }
+                }
                 match op {
-                    InfixOp::Add => Ok((int(&operands.0)? + int(&operands.1)?).into()),
-                    InfixOp::Sub => Ok((int(&operands.0)? - int(&operands.1)?).into()),
-                    InfixOp::Mul => Ok((int(&operands.0)? * int(&operands.1)?).into()),
-                    InfixOp::Div => Ok((int(&operands.0)? / int(&operands.1)?).into()),
+                    InfixOp::Add => op!(+),
+                    InfixOp::Sub => op!(-),
+                    InfixOp::Mul => op!(*),
+                    InfixOp::Div => op!(/),
                     InfixOp::Assign => match &operands.0 {
                         Ast::Atom(TokenTree::Ident(ident)) => {
-                            let value = operands.1.eval(scope.clone())?;
+                            let value = try_cf!(operands.1.eval_inner(
+                                scope.clone(),
+                                in_loop,
+                                depth + 1
+                            )?);
                             if scope.set_var(ident, value).is_ok() {
                                 Ok(().into())
                             } else {
@@ -799,14 +862,18 @@ impl Ast {
                         _ => Err(EvalError::ExpectedVar),
                     },
                     InfixOp::Equality => {
-                        let lhs = operands.0.eval(scope.clone())?;
-                        let rhs = operands.1.eval(scope.clone())?;
+                        let lhs =
+                            try_cf!(operands.0.eval_inner(scope.clone(), in_loop, depth + 1)?);
+                        let rhs =
+                            try_cf!(operands.1.eval_inner(scope.clone(), in_loop, depth + 1)?);
 
                         Ok((lhs == rhs).into())
                     }
                     InfixOp::Cmp(cmp) => {
-                        let lhs = operands.0.eval(scope.clone())?;
-                        let rhs = operands.1.eval(scope.clone())?;
+                        let lhs =
+                            try_cf!(operands.0.eval_inner(scope.clone(), in_loop, depth + 1)?);
+                        let rhs =
+                            try_cf!(operands.1.eval_inner(scope.clone(), in_loop, depth + 1)?);
 
                         let result = match (&*lhs.borrow(), &*rhs.borrow()) {
                             (Value::Unit, Value::Unit) => cmp.has_equal(),
@@ -827,11 +894,11 @@ impl Ast {
             Ast::FunctionCall {
                 fun,
                 args: call_args,
-            } => match &*fun.eval(scope.clone())?.borrow() {
+            } => match &*try_cf!(fun.eval_inner(scope.clone(), in_loop, depth + 1)?).borrow() {
                 Value::NativeFn(fun) => {
                     let mut args = Vec::with_capacity(call_args.len());
                     for i in call_args {
-                        args.push(i.eval(scope.clone())?);
+                        args.push(try_cf!(i.eval_inner(scope.clone(), in_loop, depth + 1)?));
                     }
 
                     Ok(fun(&args))
@@ -840,7 +907,7 @@ impl Ast {
                     let new_scope = scope.new_child();
                     for (i, a) in args.iter().enumerate() {
                         let val = if let Some(a) = call_args.get(i) {
-                            a.eval(scope.clone())?
+                            try_cf!(a.eval_inner(scope.clone(), in_loop, depth + 1)?)
                         } else {
                             Value::Unit.into()
                         };
@@ -862,16 +929,17 @@ impl Ast {
                 v => Err(EvalError::ExpectedFunction(v.clone())),
             },
             Ast::Index { arr, idx } => {
-                let arr = arr.eval(scope.clone())?;
+                let arr = try_cf!(arr.eval_inner(scope.clone(), in_loop, depth + 1)?);
                 let borrow = arr.borrow();
                 let arr = match &*borrow {
                     Value::Array(arr) => arr,
                     v => return Err(EvalError::ExpectedArray(v.clone())),
                 };
-                let idx = match &*idx.eval(scope.clone())?.borrow() {
-                    Value::Integer(n) => *n,
-                    v => return Err(EvalError::ExpectedInt(v.clone())),
-                };
+                let idx =
+                    match &*try_cf!(idx.eval_inner(scope.clone(), in_loop, depth + 1)?).borrow() {
+                        Value::Integer(n) => *n,
+                        v => return Err(EvalError::ExpectedInt(v.clone())),
+                    };
 
                 arr.get(idx as usize)
                     .ok_or(EvalError::OutOfBounds {
@@ -882,44 +950,48 @@ impl Ast {
             }
             Ast::Declare { var, val } => {
                 let val = if let Some(val) = val {
-                    val.eval(scope.clone())?
+                    try_cf!(val.eval_inner(scope.clone(), in_loop, depth + 1)?)
                 } else {
                     Value::Unit.into()
                 };
                 scope.declare_var(var.clone(), val);
                 Ok(Value::Unit.into())
             }
-            Ast::Block(b) => b.eval(scope.clone()),
+            Ast::Block(b) => return b.eval(scope.clone(), in_loop, depth + 1),
             Ast::LambdaLit { args, block } => Ok(Value::LambdaFn {
                 args: args.clone(),
                 body: block.clone(),
             }
             .into()),
             Ast::If { cond, body, elze } => {
-                let cond = match &*cond.eval(scope.clone())?.borrow() {
-                    Value::Bool(b) => *b,
-                    v => return Err(EvalError::ExpectedBool(v.clone())),
-                };
+                let cond =
+                    match &*try_cf!(cond.eval_inner(scope.clone(), in_loop, depth + 1)?).borrow() {
+                        Value::Bool(b) => *b,
+                        v => return Err(EvalError::ExpectedBool(v.clone())),
+                    };
 
                 if cond {
-                    body.eval(scope.clone())
+                    return body.eval(scope.clone(), in_loop, depth + 1);
                 } else if let Some(elze) = elze {
-                    elze.eval(scope.clone())
+                    return elze.eval(scope.clone(), in_loop, depth + 1);
                 } else {
                     Ok(Value::Unit.into())
                 }
             }
             Ast::While { cond, body } => {
-                let mut last = Value::Unit.into();
-                loop {
-                    match &*cond.eval(scope.clone())?.borrow() {
-                        Value::Bool(false) => break,
+                let last = loop {
+                    match &*try_cf!(cond.eval_inner(scope.clone(), true, depth + 1)?).borrow() {
+                        Value::Bool(false) => break Value::Unit.into(),
                         Value::Bool(true) => {}
                         v => return Err(EvalError::ExpectedBool(v.clone())),
                     }
 
-                    last = body.eval(scope.clone())?;
-                }
+                    match body.eval(scope.clone(), true, depth + 1)? {
+                        ControlFlow::Break(v) => break v,
+                        ControlFlow::Value(_) => {}
+                        ControlFlow::Continue => continue,
+                    }
+                };
                 Ok(last)
             }
             Ast::For {
@@ -928,7 +1000,7 @@ impl Ast {
                 array,
                 body,
             } => {
-                let a = array.eval(scope.clone())?;
+                let a = try_cf!(array.eval_inner(scope.clone(), in_loop, depth + 1)?);
                 let bor = a.borrow();
                 let array: &mut dyn Iterator<Item = ValueRef> = match bor.deref() {
                     Value::Array(a) => &mut a.iter().cloned(),
@@ -964,17 +1036,27 @@ impl Ast {
                         scope.set_var(index, Value::Integer(i as _)).unwrap();
                     }
 
-                    last = body.eval(scope.clone())?;
+                    match body.eval(scope.clone(), true, depth + 1)? {
+                        ControlFlow::Break(v) => {
+                            last = v;
+                            break;
+                        }
+                        ControlFlow::Value(v) => last = v,
+                        ControlFlow::Continue => continue,
+                    };
                 }
                 Ok(last)
             }
             Ast::Range { range, close_end } => Ok(Value::Range {
-                range: (range.0.eval(scope.clone())?, range.1.eval(scope.clone())?),
+                range: (
+                    try_cf!(range.0.eval_inner(scope.clone(), in_loop, depth + 1)?),
+                    try_cf!(range.1.eval_inner(scope.clone(), in_loop, depth + 1)?),
+                ),
                 close_end: *close_end,
             }
             .into()),
             Ast::FieldAccess { value, field } => {
-                let value = value.eval(scope.clone())?;
+                let value = try_cf!(value.eval_inner(scope.clone(), in_loop, depth + 1)?);
                 let value_cloned = value.clone();
                 match &*value.borrow() {
                     Value::Array(values) if &**field == "len" => Ok((values.len() as i32).into()),
@@ -993,7 +1075,32 @@ impl Ast {
                     v => Err(EvalError::UnknownField(v.clone(), field.clone())),
                 }
             }
+            Ast::Break(v) => {
+                if !in_loop {
+                    return Err(EvalError::UnexpectedBreak);
+                }
+                let v = if let Some(v) = v {
+                    try_cf!(v.eval_inner(scope, in_loop, depth + 1)?)
+                } else {
+                    ().into()
+                };
+                return Ok(ControlFlow::Break(v));
+            }
+            Ast::Continue => {
+                if !in_loop {
+                    return Err(EvalError::UnexpectedBreak);
+                }
+                return Ok(ControlFlow::Continue);
+            }
         }
+        .map(ControlFlow::Value)
+    }
+
+    fn eval(&self, scope: Rc<Scope>) -> Result<ValueRef, EvalError> {
+        let ControlFlow::Value(v) = self.eval_inner(scope, false, 0)? else {
+            unreachable!()
+        };
+        Ok(v)
     }
 }
 
@@ -1058,27 +1165,23 @@ where
         let mut ret = true;
         while parser.lexer.peek().is_some() {
             exprs.push(parser.parse_bp(0)?);
-            match parser.lexer.next() {
+            match parser.lexer.peek() {
                 Some(TokenTree::Punct(Punct::Semicolon)) => {
+                    parser.lexer.next();
                     // if we get a semicolon as the last token, then we don't return a value
                     if parser.lexer.peek().is_none() {
                         ret = false;
                         break;
                     }
                 }
-                Some(tok) => {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "Comma".into(),
-                        actual: tok,
-                    });
-                }
+                Some(_) => continue,
                 None => break,
             }
         }
         Ok(Block { exprs, ret })
     }
 
-    fn take_token(&mut self, tt: &TokenTree) -> Result<(), ParseError> {
+    fn expect_token(&mut self, tt: &TokenTree) -> Result<(), ParseError> {
         match self.lexer.next() {
             Some(tok) if tok == *tt => Ok(()),
             tok => Err(ParseError::unexpected(format!("{:?}", tt), tok)),
@@ -1128,6 +1231,8 @@ where
     }
 
     fn parse_bp(&mut self, min_bp: u8) -> Result<Ast, ParseError> {
+        // whether lhs is a statement (that doesn't necesarily need to be followed by a semilcolon)
+        let mut lhs_statement = false;
         let mut lhs = match self
             .lexer
             .next()
@@ -1176,7 +1281,10 @@ where
             TokenTree::Group {
                 delim: GroupDelim::Brace,
                 tokens,
-            } => Ast::Block(Self::parse_block(tokens.into_iter())?),
+            } => {
+                lhs_statement = true;
+                Ast::Block(Self::parse_block(tokens.into_iter())?)
+            }
             TokenTree::Keyword(Keyword::Let) => {
                 let v = self.take_ident()?;
 
@@ -1223,6 +1331,7 @@ where
                     None
                 };
 
+                lhs_statement = true;
                 Ast::If {
                     cond: Box::new(cond),
                     body,
@@ -1240,6 +1349,7 @@ where
                     tok => return Err(ParseError::unexpected("Block", tok)),
                 };
 
+                lhs_statement = true;
                 Ast::While {
                     cond: Box::new(cond),
                     body,
@@ -1252,7 +1362,7 @@ where
                     Some(TokenTree::Keyword(Keyword::In)) => None,
                     Some(TokenTree::Punct(Punct::Comma)) => {
                         let ident = self.take_ident()?;
-                        self.take_token(&TokenTree::Keyword(Keyword::In))?;
+                        self.expect_token(&TokenTree::Keyword(Keyword::In))?;
                         Some(ident)
                     }
                     tok => return Err(ParseError::unexpected("'in' or Comma", tok)),
@@ -1268,6 +1378,7 @@ where
                     tok => return Err(ParseError::unexpected("Block", tok)),
                 };
 
+                lhs_statement = true;
                 Ast::For {
                     var,
                     index,
@@ -1275,6 +1386,15 @@ where
                     body,
                 }
             }
+            TokenTree::Keyword(Keyword::Break) => {
+                if self.lexer.peek() != Some(&TokenTree::Punct(Punct::Semicolon)) {
+                    let expr = self.parse_bp(0)?;
+                    return Ok(Ast::Break(Some(Box::new(expr))));
+                } else {
+                    return Ok(Ast::Break(None));
+                }
+            }
+            TokenTree::Keyword(Keyword::Continue) => return Ok(Ast::Continue),
             tok @ (TokenTree::IntLit(_)
             | TokenTree::Ident(_)
             | TokenTree::Keyword(Keyword::True)
@@ -1295,11 +1415,10 @@ where
         loop {
             let op = match self.lexer.peek() {
                 None => break,
-                Some(TokenTree::Punct(Punct::Comma | Punct::Semicolon)) => {
-                    break;
-                }
+                Some(TokenTree::Punct(Punct::Comma | Punct::Semicolon)) => break,
                 Some(tok @ TokenTree::Punct(p)) if p.is_op() => tok,
                 Some(tok @ TokenTree::Group { .. }) => tok,
+                Some(_) if lhs_statement => break,
                 tok => {
                     return Err(ParseError::unexpected(
                         "operator or semicolon",
@@ -1429,9 +1548,19 @@ fn main() {
         let content = std::fs::read_to_string(path).unwrap();
         let lex = Lexer::new(&content);
         let mut parser = Parser::new(lex);
+        let mut asts = Vec::new();
         while parser.lexer.peek().is_some() {
             let e = parser.parse_expr().unwrap();
-            if let Err(e) = e.eval(scope.clone()) {
+            asts.push(e);
+        }
+
+        println!("ASTs:");
+        for a in &asts {
+            println!("    {}", a);
+        }
+
+        for a in asts {
+            if let Err(e) = a.eval(scope.clone()) {
                 println!("ERROR: {:?}", e);
                 std::process::exit(1);
             }

@@ -1,9 +1,10 @@
 // vim: syntax=rust
 
-let a = 1;
-let b = 1;
-for i in 0..10 {
-    print(a);
-    b = a + b;
-    a = b - a;
+for y in 0..5 {
+    for x in 0..5 {
+        if x == 2 {
+            continue;
+        }
+        print(x, y);
+    }
 }
