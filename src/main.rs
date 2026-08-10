@@ -166,12 +166,16 @@ impl<'a> Lexer<'a> {
             self.skip_whitespace();
             let next = self.take_char()?;
             if next == end {
-                break;
+                return Some(out);
             }
             self.untake_char(next);
-            out.push(self.next_token()?);
+            let Some(c) = self.next_token() else {
+                break;
+            };
+            out.push(c);
         }
-        Some(out)
+
+        panic!("Unclosed block");
     }
 
     fn next_token(&mut self) -> Option<TokenTree> {
@@ -818,6 +822,28 @@ impl Ast {
     }
 }
 
+#[expect(unused)]
+#[derive(Debug, Clone)]
+enum ParseError {
+    UnexpectedToken { expected: String, actual: TokenTree },
+    UnexpectedEof { expected: String },
+}
+
+impl ParseError {
+    fn unexpected(expected: impl Into<String>, actual: Option<TokenTree>) -> Self {
+        if let Some(actual) = actual {
+            ParseError::UnexpectedToken {
+                expected: expected.into(),
+                actual,
+            }
+        } else {
+            ParseError::UnexpectedEof {
+                expected: expected.into(),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Parser<I: Iterator<Item = TokenTree>> {
     lexer: Peekable<I>,
@@ -833,21 +859,25 @@ where
         }
     }
 
-    fn parse_comma_sep_exprs(tokens: impl Iterator<Item = TokenTree>) -> Option<Vec<Ast>> {
+    fn parse_comma_sep_exprs(
+        tokens: impl Iterator<Item = TokenTree>,
+    ) -> Result<Vec<Ast>, ParseError> {
         let mut exprs = Vec::new();
         let mut parser = Parser::new(tokens);
         while parser.lexer.peek().is_some() {
             exprs.push(parser.parse_expr()?);
             match parser.lexer.next() {
                 Some(TokenTree::Punct(Punct::Comma)) => continue,
-                Some(tok) => panic!("Unexpected token: {:?}", tok),
+                Some(tok) => {
+                    return Err(ParseError::unexpected("Comma", Some(tok)));
+                }
                 None => break,
             }
         }
-        Some(exprs)
+        Ok(exprs)
     }
 
-    fn parse_block(tokens: impl Iterator<Item = TokenTree>) -> Option<Block> {
+    fn parse_block(tokens: impl Iterator<Item = TokenTree>) -> Result<Block, ParseError> {
         let mut exprs = Vec::new();
         let mut parser = Parser::new(tokens);
         let mut ret = true;
@@ -861,18 +891,22 @@ where
                         break;
                     }
                 }
-                Some(tok) => panic!("Unexpected token: {:?}", tok),
+                Some(tok) => {
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "Comma".into(),
+                        actual: tok,
+                    });
+                }
                 None => break,
             }
         }
-        Some(Block { exprs, ret })
+        Ok(Block { exprs, ret })
     }
 
-    fn take_token(&mut self, tt: &TokenTree) {
+    fn take_token(&mut self, tt: &TokenTree) -> Result<(), ParseError> {
         match self.lexer.next() {
-            Some(tok) if tok == *tt => {}
-            Some(tok) => panic!("Unexpected token: {:?}", tok),
-            None => panic!("Unexpected EOF"),
+            Some(tok) if tok == *tt => Ok(()),
+            tok => Err(ParseError::unexpected(format!("{:?}", tt), tok)),
         }
     }
 
@@ -911,8 +945,12 @@ where
         }
     }
 
-    fn parse_bp(&mut self, min_bp: u8) -> Option<Ast> {
-        let mut lhs = match self.lexer.next()? {
+    fn parse_bp(&mut self, min_bp: u8) -> Result<Ast, ParseError> {
+        let mut lhs = match self
+            .lexer
+            .next()
+            .ok_or_else(|| ParseError::unexpected("token", None))?
+        {
             TokenTree::Group {
                 delim: GroupDelim::Paren,
                 tokens,
@@ -924,12 +962,12 @@ where
                     while let Some(tt) = parser.lexer.next() {
                         let ident = match tt {
                             TokenTree::Ident(ident) => ident,
-                            tok => panic!("Unexpected token: {:?}", tok),
+                            tok => return Err(ParseError::unexpected("identifier", Some(tok))),
                         };
                         args.push(ident);
                         match parser.lexer.next() {
                             Some(TokenTree::Punct(Punct::Comma)) => continue,
-                            Some(tok) => panic!("Unexpected token: {:?}", tok),
+                            Some(tok) => return Err(ParseError::unexpected("Comma", Some(tok))),
                             None => break,
                         }
                     }
@@ -963,24 +1001,22 @@ where
             TokenTree::Keyword(Keyword::Let) => {
                 let v = match self.lexer.next() {
                     Some(TokenTree::Ident(ident)) => ident,
-                    Some(tok) => panic!("Unexpected token: {:?}", tok),
-                    None => panic!("Unexpected EOF"),
+                    tok => return Err(ParseError::unexpected("identifier", tok)),
                 };
 
-                match self.lexer.peek() {
+                return match self.lexer.peek() {
                     Some(TokenTree::Punct(Punct::Semicolon)) => {
-                        return Some(Ast::Declare { var: v, val: None });
+                        Ok(Ast::Declare { var: v, val: None })
                     }
                     Some(TokenTree::Punct(Punct::Eq)) => {
                         self.lexer.next().unwrap(); // munch eq
                         let expr = self.parse_expr()?;
-                        return Some(Ast::Declare {
+                        Ok(Ast::Declare {
                             var: v,
                             val: Some(Box::new(expr)),
-                        });
+                        })
                     }
-                    Some(tok) => panic!("Unexpected token: {:?}", tok),
-                    None => panic!("Unexpected EOF"),
+                    tok => Err(ParseError::unexpected("semicolon or eq", tok.cloned())),
                 };
             }
             TokenTree::Keyword(Keyword::If) => {
@@ -991,8 +1027,7 @@ where
                         delim: GroupDelim::Brace,
                         tokens,
                     }) => Self::parse_block(tokens.into_iter())?,
-                    Some(tok) => panic!("Unexpected token: {:?}", tok),
-                    None => panic!("Unexpected EOF"),
+                    tok => return Err(ParseError::unexpected("Block", tok)),
                 };
 
                 let elze = if self
@@ -1005,8 +1040,7 @@ where
                             delim: GroupDelim::Brace,
                             tokens,
                         }) => Self::parse_block(tokens.into_iter())?,
-                        Some(tok) => panic!("Unexpected token: {:?}", tok),
-                        None => panic!("Unexpected EOF"),
+                        tok => return Err(ParseError::unexpected("Block", tok)),
                     };
                     Some(body)
                 } else {
@@ -1027,8 +1061,7 @@ where
                         delim: GroupDelim::Brace,
                         tokens,
                     }) => Self::parse_block(tokens.into_iter())?,
-                    Some(tok) => panic!("Unexpected token: {:?}", tok),
-                    None => panic!("Unexpected EOF"),
+                    tok => return Err(ParseError::unexpected("Block", tok)),
                 };
 
                 Ast::While {
@@ -1039,8 +1072,7 @@ where
             TokenTree::Keyword(Keyword::For) => {
                 let var = match self.lexer.next() {
                     Some(TokenTree::Ident(ident)) => ident,
-                    Some(tok) => panic!("Unexpected token: {:?}", tok),
-                    None => panic!("Unexpected EOF"),
+                    tok => return Err(ParseError::unexpected("identifier", tok)),
                 };
 
                 let index = match self.lexer.next() {
@@ -1048,14 +1080,12 @@ where
                     Some(TokenTree::Punct(Punct::Comma)) => {
                         let ident = match self.lexer.next() {
                             Some(TokenTree::Ident(ident)) => ident,
-                            Some(tok) => panic!("Unexpected token: {:?}", tok),
-                            None => panic!("Unexpected EOF"),
+                            tok => return Err(ParseError::unexpected("identifier", tok)),
                         };
-                        self.take_token(&TokenTree::Keyword(Keyword::In));
+                        self.take_token(&TokenTree::Keyword(Keyword::In))?;
                         Some(ident)
                     }
-                    Some(tok) => panic!("Unexpected token: {:?}", tok),
-                    None => panic!("Unexpected EOF"),
+                    tok => return Err(ParseError::unexpected("'in' or Comma", tok)),
                 };
 
                 let array = self.parse_expr()?;
@@ -1065,8 +1095,7 @@ where
                         delim: GroupDelim::Brace,
                         tokens,
                     }) => Self::parse_block(tokens.into_iter())?,
-                    Some(tok) => panic!("Unexpected token: {:?}", tok),
-                    None => panic!("Unexpected EOF"),
+                    tok => return Err(ParseError::unexpected("Block", tok)),
                 };
 
                 Ast::For {
@@ -1090,7 +1119,7 @@ where
                     operand: Box::new(rhs),
                 }
             }
-            tok => panic!("Unexpected token: {:?}", tok),
+            tok => return Err(ParseError::unexpected("expression", Some(tok))),
         };
 
         loop {
@@ -1101,7 +1130,7 @@ where
                 }
                 Some(tok @ TokenTree::Punct(p)) if p.is_op() => tok,
                 Some(tok @ TokenTree::Group { .. }) => tok,
-                tok => panic!("Unexpected token: {:?}", tok),
+                tok => return Err(ParseError::unexpected("operator", tok.cloned())),
             };
 
             if let Some((l_bp, ())) = Self::postfix_bp(op) {
@@ -1180,10 +1209,10 @@ where
             break;
         }
 
-        Some(lhs)
+        Ok(lhs)
     }
 
-    fn parse_expr(&mut self) -> Option<Ast> {
+    fn parse_expr(&mut self) -> Result<Ast, ParseError> {
         self.parse_bp(0)
     }
 }
