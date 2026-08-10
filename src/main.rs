@@ -1,5 +1,11 @@
 use std::{
-    cell::RefCell, cmp::Ordering, collections::HashMap, fmt::Display, io::Write, iter::Peekable,
+    cell::{Ref, RefCell, RefMut},
+    cmp::Ordering,
+    collections::HashMap,
+    fmt::{Debug, Display},
+    io::Write,
+    iter::Peekable,
+    ops::Deref,
     rc::Rc,
 };
 
@@ -57,6 +63,8 @@ enum Punct {
     /// `=>`
     FatArrow,
     Semicolon,
+    /// `.`
+    Dot,
     /// `..`
     DotDot,
     /// `..=`
@@ -77,6 +85,7 @@ impl Punct {
             | Self::Lte
             | Self::Gt
             | Self::Gte
+            | Self::Dot
             | Self::DotDot
             | Self::DotDotEq => true,
             Self::Comma | Self::Semicolon | Self::FatArrow => false,
@@ -96,7 +105,7 @@ enum GroupDelim {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenTree {
-    Ident(String),
+    Ident(Rc<str>),
     IntLit(u32),
     Punct(Punct),
     Group {
@@ -235,6 +244,7 @@ impl<'a> Lexer<'a> {
                     TokenTree::Punct(Punct::DotDot)
                 }
             }
+            '.' => TokenTree::Punct(Punct::Dot),
             '(' => TokenTree::Group {
                 delim: GroupDelim::Paren,
                 tokens: self.take_group(')')?,
@@ -309,7 +319,7 @@ impl Cmp {
 #[derive(Debug)]
 struct Scope {
     parent: Option<Rc<Scope>>,
-    vars: RefCell<HashMap<String, Value>>,
+    vars: RefCell<HashMap<Rc<str>, ValueRef>>,
 }
 
 impl Scope {
@@ -320,7 +330,7 @@ impl Scope {
         })
     }
 
-    fn get_var(self: &Rc<Self>, var: &str) -> Option<Value> {
+    fn get_var(self: &Rc<Self>, var: &str) -> Option<ValueRef> {
         if let Some(val) = self.vars.borrow().get(var) {
             Some(val.clone())
         } else if let Some(parent) = &self.parent {
@@ -331,19 +341,22 @@ impl Scope {
     }
 
     /// Returns false if the variable was already declared
-    fn declare_var(self: &Rc<Self>, var: impl Into<String>, value: Value) -> bool {
-        self.vars.borrow_mut().insert(var.into(), value).is_none()
+    fn declare_var(self: &Rc<Self>, var: impl Into<Rc<str>>, value: impl Into<ValueRef>) -> bool {
+        self.vars
+            .borrow_mut()
+            .insert(var.into(), value.into())
+            .is_none()
     }
 
     /// returns Err if the variable was not defined
-    fn set_var(self: &Rc<Self>, var: &str, value: Value) -> Result<(), Value> {
+    fn set_var(self: &Rc<Self>, var: &str, value: impl Into<ValueRef>) -> Result<(), ()> {
         if let Some(val) = self.vars.borrow_mut().get_mut(var) {
-            *val = value;
+            *val = value.into();
             Ok(())
         } else if let Some(parent) = &self.parent {
             parent.set_var(var, value)
         } else {
-            Err(value)
+            Err(())
         }
     }
 
@@ -387,12 +400,16 @@ impl Display for Block {
 }
 
 impl Block {
-    fn eval(&self, scope: Rc<Scope>) -> Result<Value, EvalError> {
-        let mut last = Value::Unit;
+    fn eval(&self, scope: Rc<Scope>) -> Result<ValueRef, EvalError> {
+        let mut last = Value::Unit.into();
         for e in &self.exprs {
             last = e.eval(scope.clone())?;
         }
-        if self.ret { Ok(last) } else { Ok(Value::Unit) }
+        if self.ret {
+            Ok(last)
+        } else {
+            Ok(Value::Unit.into())
+        }
     }
 }
 
@@ -421,12 +438,12 @@ enum Ast {
         idx: Box<Ast>,
     },
     Declare {
-        var: String,
+        var: Rc<str>,
         val: Option<Box<Ast>>,
     },
     Block(Block),
     LambdaLit {
-        args: Vec<String>,
+        args: Vec<Rc<str>>,
         block: Block,
     },
     If {
@@ -439,14 +456,18 @@ enum Ast {
         body: Block,
     },
     For {
-        var: String,
-        index: Option<String>,
+        var: Rc<str>,
+        index: Option<Rc<str>>,
         array: Box<Ast>,
         body: Block,
     },
     Range {
         range: Box<(Ast, Ast)>,
         close_end: bool,
+    },
+    FieldAccess {
+        value: Box<Ast>,
+        field: Rc<str>,
     },
 }
 
@@ -524,27 +545,150 @@ impl Display for Ast {
                     range.1
                 )
             }
+            Ast::FieldAccess {
+                value: object,
+                field,
+            } => {
+                write!(f, "({}.{})", object, field)
+            }
         }
     }
 }
 
+type NativeFn = Rc<dyn Fn(&[ValueRef]) -> ValueRef>;
+
 #[allow(unpredictable_function_pointer_comparisons)] // not really important here
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 enum Value {
     #[default]
     Unit,
     Bool(bool),
     Integer(i32),
-    NativeFn(fn(&[Value]) -> Value),
+    NativeFn(NativeFn),
     LambdaFn {
-        args: Vec<String>,
+        args: Vec<Rc<str>>,
         body: Block,
     },
-    Array(Vec<Value>),
+    Array(Vec<ValueRef>),
     Range {
-        range: Box<(Value, Value)>,
+        range: (ValueRef, ValueRef),
         close_end: bool,
     },
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bool(l0), Self::Bool(r0)) => l0 == r0,
+            (Self::Integer(l0), Self::Integer(r0)) => l0 == r0,
+            (Self::NativeFn(_), Self::NativeFn(_)) => false,
+            (
+                Self::LambdaFn {
+                    args: l_args,
+                    body: l_body,
+                },
+                Self::LambdaFn {
+                    args: r_args,
+                    body: r_body,
+                },
+            ) => l_args == r_args && l_body == r_body,
+            (Self::Array(l0), Self::Array(r0)) => *l0 == *r0,
+            (
+                Self::Range {
+                    range: l_range,
+                    close_end: l_close_end,
+                },
+                Self::Range {
+                    range: r_range,
+                    close_end: r_close_end,
+                },
+            ) => l_range == r_range && l_close_end == r_close_end,
+            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
+        }
+    }
+}
+
+impl Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unit => write!(f, "Unit"),
+            Self::Bool(arg0) => f.debug_tuple("Bool").field(arg0).finish(),
+            Self::Integer(arg0) => f.debug_tuple("Integer").field(arg0).finish(),
+            Self::NativeFn(_) => f.debug_tuple("NativeFn").finish_non_exhaustive(),
+            Self::LambdaFn { args, body } => f
+                .debug_struct("LambdaFn")
+                .field("args", args)
+                .field("body", body)
+                .finish(),
+            Self::Array(arg0) => f.debug_tuple("Array").field(arg0).finish(),
+            Self::Range { range, close_end } => f
+                .debug_struct("Range")
+                .field("range", range)
+                .field("close_end", close_end)
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq<bool> for Value {
+    fn eq(&self, other: &bool) -> bool {
+        match self {
+            Self::Bool(b) => *b == *other,
+            _ => false,
+        }
+    }
+}
+
+impl From<()> for Value {
+    fn from((): ()) -> Self {
+        Value::Unit
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Value::Bool(value)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(value: i32) -> Self {
+        Value::Integer(value)
+    }
+}
+
+impl From<Vec<ValueRef>> for Value {
+    fn from(value: Vec<ValueRef>) -> Self {
+        Value::Array(value)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ValueRef(Rc<RefCell<Value>>);
+
+impl Display for ValueRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0.borrow(), f)
+    }
+}
+
+impl<T> From<T> for ValueRef
+where
+    Value: From<T>,
+{
+    fn from(value: T) -> Self {
+        Self(Rc::new(RefCell::new(value.into())))
+    }
+}
+
+impl ValueRef {
+    fn borrow(&self) -> Ref<'_, Value> {
+        self.0.borrow()
+    }
+
+    fn borrow_mut(&self) -> RefMut<'_, Value> {
+        self.0.borrow_mut()
+    }
 }
 
 impl Display for Value {
@@ -553,7 +697,7 @@ impl Display for Value {
             Value::Unit => write!(f, "()"),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Integer(n) => write!(f, "{}", n),
-            Value::NativeFn(fun) => write!(f, "<function {:?}>", fun),
+            Value::NativeFn(_) => write!(f, "<native function>"),
             Value::LambdaFn { .. } => write!(f, "<lambda>"),
             Value::Array(a) => {
                 write!(f, "[")?;
@@ -587,19 +731,20 @@ enum EvalError {
     ExpectedArray(Value),
     ExpectedFunction(Value),
     OutOfBounds { max: usize, idx: i32 },
-    UndefinedVariable(String),
+    UndefinedVariable(Rc<str>),
+    UnknownField(Value, Rc<str>),
 }
 
 impl Ast {
-    fn eval(&self, scope: Rc<Scope>) -> Result<Value, EvalError> {
+    fn eval(&self, scope: Rc<Scope>) -> Result<ValueRef, EvalError> {
         match self {
             Ast::Atom(token) => match token {
                 TokenTree::Ident(ident) => scope
                     .get_var(ident)
                     .ok_or_else(|| EvalError::UndefinedVariable(ident.clone())),
-                TokenTree::IntLit(n) => Ok(Value::Integer(*n as _)),
-                TokenTree::Keyword(Keyword::True) => Ok(Value::Bool(true)),
-                TokenTree::Keyword(Keyword::False) => Ok(Value::Bool(false)),
+                TokenTree::IntLit(n) => Ok((*n as i32).into()),
+                TokenTree::Keyword(Keyword::True) => Ok(true.into()),
+                TokenTree::Keyword(Keyword::False) => Ok(false.into()),
                 _ => unreachable!(),
             },
             Ast::ArrayLit(items) => {
@@ -607,45 +752,45 @@ impl Ast {
                 for i in items {
                     items2.push(i.eval(scope.clone())?);
                 }
-                Ok(Value::Array(items2))
+                Ok(items2.into())
             }
             Ast::PrefixOp { op, operand } => match op {
-                PrefixOp::Neg => match operand.eval(scope)? {
-                    Value::Integer(n) => Ok(Value::Integer(n as _)),
-                    v => Err(EvalError::ExpectedInt(v)),
+                PrefixOp::Neg => match &*operand.eval(scope)?.borrow() {
+                    Value::Integer(n) => Ok((-n).into()),
+                    v => Err(EvalError::ExpectedInt(v.clone())),
                 },
             },
             Ast::PostfixOp { op, operand } => match op {
                 PostfixOp::Factorial => {
-                    let n = match operand.eval(scope)? {
-                        Value::Integer(n) => n,
-                        v => return Err(EvalError::ExpectedInt(v)),
+                    let n = match &*operand.eval(scope)?.borrow() {
+                        Value::Integer(n) => *n,
+                        v => return Err(EvalError::ExpectedInt(v.clone())),
                     };
 
                     let mut out = 1;
                     for i in 1..=n {
                         out *= i;
                     }
-                    Ok(Value::Integer(out))
+                    Ok(out.into())
                 }
             },
             Ast::BinOp { op, operands } => {
                 let int = |ast: &Ast| -> Result<i32, EvalError> {
-                    match ast.eval(scope.clone())? {
-                        Value::Integer(n) => Ok(n),
-                        v => Err(EvalError::ExpectedInt(v)),
+                    match &*ast.eval(scope.clone())?.borrow() {
+                        Value::Integer(n) => Ok(*n),
+                        v => Err(EvalError::ExpectedInt(v.clone())),
                     }
                 };
                 match op {
-                    InfixOp::Add => Ok(Value::Integer(int(&operands.0)? + int(&operands.1)?)),
-                    InfixOp::Sub => Ok(Value::Integer(int(&operands.0)? - int(&operands.1)?)),
-                    InfixOp::Mul => Ok(Value::Integer(int(&operands.0)? * int(&operands.1)?)),
-                    InfixOp::Div => Ok(Value::Integer(int(&operands.0)? / int(&operands.1)?)),
+                    InfixOp::Add => Ok((int(&operands.0)? + int(&operands.1)?).into()),
+                    InfixOp::Sub => Ok((int(&operands.0)? - int(&operands.1)?).into()),
+                    InfixOp::Mul => Ok((int(&operands.0)? * int(&operands.1)?).into()),
+                    InfixOp::Div => Ok((int(&operands.0)? / int(&operands.1)?).into()),
                     InfixOp::Assign => match &operands.0 {
                         Ast::Atom(TokenTree::Ident(ident)) => {
                             let value = operands.1.eval(scope.clone())?;
                             if scope.set_var(ident, value).is_ok() {
-                                Ok(Value::Unit)
+                                Ok(().into())
                             } else {
                                 Err(EvalError::UndefinedVariable(ident.clone()))
                             }
@@ -657,16 +802,16 @@ impl Ast {
                         let lhs = operands.0.eval(scope.clone())?;
                         let rhs = operands.1.eval(scope.clone())?;
 
-                        Ok(Value::Bool(lhs == rhs))
+                        Ok((lhs == rhs).into())
                     }
                     InfixOp::Cmp(cmp) => {
                         let lhs = operands.0.eval(scope.clone())?;
                         let rhs = operands.1.eval(scope.clone())?;
 
-                        let result = match (lhs, rhs) {
+                        let result = match (&*lhs.borrow(), &*rhs.borrow()) {
                             (Value::Unit, Value::Unit) => cmp.has_equal(),
-                            (Value::Bool(l), Value::Bool(r)) => cmp.matches(l.cmp(&r)),
-                            (Value::Integer(l), Value::Integer(r)) => cmp.matches(l.cmp(&r)),
+                            (Value::Bool(l), Value::Bool(r)) => cmp.matches(l.cmp(r)),
+                            (Value::Integer(l), Value::Integer(r)) => cmp.matches(l.cmp(r)),
                             (Value::NativeFn(_), Value::NativeFn(_)) => false,
                             (Value::LambdaFn { .. }, Value::LambdaFn { .. }) => false,
                             (Value::Array(_), Value::Array(_)) => {
@@ -675,14 +820,14 @@ impl Ast {
                             _ => false,
                         };
 
-                        Ok(Value::Bool(result))
+                        Ok(result.into())
                     }
                 }
             }
             Ast::FunctionCall {
                 fun,
                 args: call_args,
-            } => match fun.eval(scope.clone())? {
+            } => match &*fun.eval(scope.clone())?.borrow() {
                 Value::NativeFn(fun) => {
                     let mut args = Vec::with_capacity(call_args.len());
                     for i in call_args {
@@ -697,29 +842,35 @@ impl Ast {
                         let val = if let Some(a) = call_args.get(i) {
                             a.eval(scope.clone())?
                         } else {
-                            Value::Unit
+                            Value::Unit.into()
                         };
 
-                        new_scope.declare_var(a, val);
+                        new_scope.declare_var(a.clone(), val);
                     }
 
-                    let mut last = Value::Unit;
+                    let mut last = Value::Unit.into();
                     for e in &body.exprs {
                         last = e.eval(new_scope.clone())?;
                     }
 
-                    if body.ret { Ok(last) } else { Ok(Value::Unit) }
+                    if body.ret {
+                        Ok(last)
+                    } else {
+                        Ok(Value::Unit.into())
+                    }
                 }
-                v => Err(EvalError::ExpectedFunction(v)),
+                v => Err(EvalError::ExpectedFunction(v.clone())),
             },
             Ast::Index { arr, idx } => {
-                let arr = match arr.eval(scope.clone())? {
+                let arr = arr.eval(scope.clone())?;
+                let borrow = arr.borrow();
+                let arr = match &*borrow {
                     Value::Array(arr) => arr,
-                    v => return Err(EvalError::ExpectedArray(v)),
+                    v => return Err(EvalError::ExpectedArray(v.clone())),
                 };
-                let idx = match idx.eval(scope.clone())? {
-                    Value::Integer(n) => n,
-                    v => return Err(EvalError::ExpectedInt(v)),
+                let idx = match &*idx.eval(scope.clone())?.borrow() {
+                    Value::Integer(n) => *n,
+                    v => return Err(EvalError::ExpectedInt(v.clone())),
                 };
 
                 arr.get(idx as usize)
@@ -733,20 +884,21 @@ impl Ast {
                 let val = if let Some(val) = val {
                     val.eval(scope.clone())?
                 } else {
-                    Value::Unit
+                    Value::Unit.into()
                 };
                 scope.declare_var(var.clone(), val);
-                Ok(Value::Unit)
+                Ok(Value::Unit.into())
             }
             Ast::Block(b) => b.eval(scope.clone()),
             Ast::LambdaLit { args, block } => Ok(Value::LambdaFn {
                 args: args.clone(),
                 body: block.clone(),
-            }),
+            }
+            .into()),
             Ast::If { cond, body, elze } => {
-                let cond = match cond.eval(scope.clone())? {
-                    Value::Bool(b) => b,
-                    v => return Err(EvalError::ExpectedBool(v)),
+                let cond = match &*cond.eval(scope.clone())?.borrow() {
+                    Value::Bool(b) => *b,
+                    v => return Err(EvalError::ExpectedBool(v.clone())),
                 };
 
                 if cond {
@@ -754,16 +906,16 @@ impl Ast {
                 } else if let Some(elze) = elze {
                     elze.eval(scope.clone())
                 } else {
-                    Ok(Value::Unit)
+                    Ok(Value::Unit.into())
                 }
             }
             Ast::While { cond, body } => {
-                let mut last = Value::Unit;
+                let mut last = Value::Unit.into();
                 loop {
-                    match cond.eval(scope.clone())? {
+                    match &*cond.eval(scope.clone())?.borrow() {
                         Value::Bool(false) => break,
                         Value::Bool(true) => {}
-                        v => return Err(EvalError::ExpectedBool(v)),
+                        v => return Err(EvalError::ExpectedBool(v.clone())),
                     }
 
                     last = body.eval(scope.clone())?;
@@ -776,34 +928,36 @@ impl Ast {
                 array,
                 body,
             } => {
-                let mut last = Value::Unit;
-                let array: &mut dyn Iterator<Item = Value> = match array.eval(scope.clone())? {
-                    Value::Array(a) => &mut a.into_iter(),
+                let a = array.eval(scope.clone())?;
+                let bor = a.borrow();
+                let array: &mut dyn Iterator<Item = ValueRef> = match bor.deref() {
+                    Value::Array(a) => &mut a.iter().cloned(),
                     Value::Range { range, close_end } => {
-                        let start = match range.0 {
+                        let &start = match &*range.0.borrow() {
                             Value::Integer(n) => n,
-                            v => return Err(EvalError::ExpectedInt(v)),
+                            v => return Err(EvalError::ExpectedInt(v.clone())),
                         };
-                        let end = match range.1 {
+                        let &end = match &*range.1.borrow() {
                             Value::Integer(n) => n,
-                            v => return Err(EvalError::ExpectedInt(v)),
+                            v => return Err(EvalError::ExpectedInt(v.clone())),
                         };
 
-                        if close_end {
-                            &mut (start..end).map(Value::Integer)
+                        if *close_end {
+                            &mut (start..end).map(Into::into)
                         } else {
-                            &mut (start..=end).map(Value::Integer)
+                            &mut (start..=end).map(Into::into)
                         }
                     }
-                    v => return Err(EvalError::ExpectedArray(v)),
+                    v => return Err(EvalError::ExpectedArray(v.clone())),
                 };
                 let scope = scope.new_child();
 
-                scope.declare_var(var, Value::Unit);
+                scope.declare_var(var.clone(), ());
                 if let Some(index) = index {
-                    scope.declare_var(index, Value::Unit);
+                    scope.declare_var(index.clone(), ());
                 }
 
+                let mut last = Value::Unit.into();
                 for (i, item) in array.into_iter().enumerate() {
                     scope.set_var(var, item).unwrap();
                     if let Some(index) = index {
@@ -815,9 +969,30 @@ impl Ast {
                 Ok(last)
             }
             Ast::Range { range, close_end } => Ok(Value::Range {
-                range: Box::new((range.0.eval(scope.clone())?, range.1.eval(scope.clone())?)),
+                range: (range.0.eval(scope.clone())?, range.1.eval(scope.clone())?),
                 close_end: *close_end,
-            }),
+            }
+            .into()),
+            Ast::FieldAccess { value, field } => {
+                let value = value.eval(scope.clone())?;
+                let value_cloned = value.clone();
+                match &*value.borrow() {
+                    Value::Array(values) if &**field == "len" => Ok((values.len() as i32).into()),
+                    Value::Array(values) if &**field == "push" => {
+                        Ok(Value::NativeFn(Rc::new(move |a| {
+                            match &mut *value_cloned.borrow_mut() {
+                                Value::Array(v) => {
+                                    v.extend(a.iter().cloned());
+                                }
+                                _ => unreachable!(),
+                            }
+                            ().into()
+                        }))
+                        .into())
+                    }
+                    v => Err(EvalError::UnknownField(v.clone(), field.clone())),
+                }
+            }
         }
     }
 }
@@ -910,6 +1085,13 @@ where
         }
     }
 
+    fn take_ident(&mut self) -> Result<Rc<str>, ParseError> {
+        match self.lexer.next() {
+            Some(TokenTree::Ident(d)) => Ok(d.clone()),
+            tok => Err(ParseError::unexpected("identifier", tok)),
+        }
+    }
+
     // TODO: literal numbers for bp is hard
 
     // returns ((), u8) to be clear it's a prefix
@@ -936,7 +1118,7 @@ where
     // returns (u8, ()) to be clear it's a postfix
     fn postfix_bp(op: &TokenTree) -> Option<(u8, ())> {
         match op {
-            TokenTree::Punct(Punct::Bang)
+            TokenTree::Punct(Punct::Bang | Punct::Dot)
             | TokenTree::Group {
                 delim: GroupDelim::Paren | GroupDelim::Bracket,
                 ..
@@ -959,11 +1141,8 @@ where
                     self.lexer.next().expect("peeked above");
                     let mut args = Vec::new();
                     let mut parser = Parser::new(tokens.into_iter());
-                    while let Some(tt) = parser.lexer.next() {
-                        let ident = match tt {
-                            TokenTree::Ident(ident) => ident,
-                            tok => return Err(ParseError::unexpected("identifier", Some(tok))),
-                        };
+                    while parser.lexer.peek().is_some() {
+                        let ident = parser.take_ident()?;
                         args.push(ident);
                         match parser.lexer.next() {
                             Some(TokenTree::Punct(Punct::Comma)) => continue,
@@ -999,10 +1178,7 @@ where
                 tokens,
             } => Ast::Block(Self::parse_block(tokens.into_iter())?),
             TokenTree::Keyword(Keyword::Let) => {
-                let v = match self.lexer.next() {
-                    Some(TokenTree::Ident(ident)) => ident,
-                    tok => return Err(ParseError::unexpected("identifier", tok)),
-                };
+                let v = self.take_ident()?;
 
                 return match self.lexer.peek() {
                     Some(TokenTree::Punct(Punct::Semicolon)) => {
@@ -1070,18 +1246,12 @@ where
                 }
             }
             TokenTree::Keyword(Keyword::For) => {
-                let var = match self.lexer.next() {
-                    Some(TokenTree::Ident(ident)) => ident,
-                    tok => return Err(ParseError::unexpected("identifier", tok)),
-                };
+                let var = self.take_ident()?;
 
                 let index = match self.lexer.next() {
                     Some(TokenTree::Keyword(Keyword::In)) => None,
                     Some(TokenTree::Punct(Punct::Comma)) => {
-                        let ident = match self.lexer.next() {
-                            Some(TokenTree::Ident(ident)) => ident,
-                            tok => return Err(ParseError::unexpected("identifier", tok)),
-                        };
+                        let ident = self.take_ident()?;
                         self.take_token(&TokenTree::Keyword(Keyword::In))?;
                         Some(ident)
                     }
@@ -1140,6 +1310,13 @@ where
                 let op = self.lexer.next().expect("checked above");
 
                 lhs = match op {
+                    TokenTree::Punct(Punct::Dot) => {
+                        let ident = self.take_ident()?;
+                        Ast::FieldAccess {
+                            value: Box::new(lhs),
+                            field: ident,
+                        }
+                    }
                     TokenTree::Group {
                         delim: GroupDelim::Paren,
                         tokens,
@@ -1222,7 +1399,7 @@ fn main() {
 
     scope.declare_var(
         "print",
-        Value::NativeFn(|a| {
+        Value::NativeFn(Rc::new(|a| {
             for (i, a) in a.iter().enumerate() {
                 if i > 0 {
                     print!(" ");
@@ -1230,8 +1407,8 @@ fn main() {
                 print!("{}", a);
             }
             println!();
-            Value::Unit
-        }),
+            Value::Unit.into()
+        })),
     );
     scope.declare_var("debug", Value::Bool(true));
 
@@ -1245,9 +1422,7 @@ fn main() {
             continue;
         }
 
-        let debug = scope
-            .get_var("debug")
-            .is_some_and(|v| v == Value::Bool(true));
+        let debug = scope.get_var("debug").is_some_and(|v| *v.borrow() == true);
 
         if debug {
             let lex = Lexer::new(&l);
