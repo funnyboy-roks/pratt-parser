@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, collections::HashMap, fmt::Display, io::Write, iter::Peekable};
+use std::{
+    cell::RefCell, cmp::Ordering, collections::HashMap, fmt::Display, io::Write, iter::Peekable,
+    rc::Rc,
+};
 
 #[cfg(test)]
 mod test;
@@ -10,6 +13,9 @@ enum Keyword {
     False,
     If,
     Else,
+    While,
+    For,
+    In,
 }
 
 impl Keyword {
@@ -20,6 +26,9 @@ impl Keyword {
             "false" => Some(Self::False),
             "if" => Some(Self::If),
             "else" => Some(Self::Else),
+            "while" => Some(Self::While),
+            "for" => Some(Self::For),
+            "in" => Some(Self::In),
             _ => None,
         }
     }
@@ -48,6 +57,10 @@ enum Punct {
     /// `=>`
     FatArrow,
     Semicolon,
+    /// `..`
+    DotDot,
+    /// `..=`
+    DotDotEq,
 }
 
 impl Punct {
@@ -63,7 +76,9 @@ impl Punct {
             | Self::Lt
             | Self::Lte
             | Self::Gt
-            | Self::Gte => true,
+            | Self::Gte
+            | Self::DotDot
+            | Self::DotDotEq => true,
             Self::Comma | Self::Semicolon | Self::FatArrow => false,
         }
     }
@@ -207,6 +222,15 @@ impl<'a> Lexer<'a> {
                 None => TokenTree::Punct(Punct::Eq),
             },
             ';' => TokenTree::Punct(Punct::Semicolon),
+            '.' if self.peek_char() == Some('.') => {
+                self.take_char();
+                if self.peek_char() == Some('=') {
+                    self.take_char();
+                    TokenTree::Punct(Punct::DotDotEq)
+                } else {
+                    TokenTree::Punct(Punct::DotDot)
+                }
+            }
             '(' => TokenTree::Group {
                 delim: GroupDelim::Paren,
                 tokens: self.take_group(')')?,
@@ -278,6 +302,55 @@ impl Cmp {
     }
 }
 
+#[derive(Debug)]
+struct Scope {
+    parent: Option<Rc<Scope>>,
+    vars: RefCell<HashMap<String, Value>>,
+}
+
+impl Scope {
+    fn new() -> Rc<Scope> {
+        Rc::new(Scope {
+            parent: None,
+            vars: Default::default(),
+        })
+    }
+
+    fn get_var(self: &Rc<Self>, var: &str) -> Option<Value> {
+        if let Some(val) = self.vars.borrow().get(var) {
+            Some(val.clone())
+        } else if let Some(parent) = &self.parent {
+            parent.get_var(var).clone()
+        } else {
+            None
+        }
+    }
+
+    /// Returns false if the variable was already declared
+    fn declare_var(self: &Rc<Self>, var: impl Into<String>, value: Value) -> bool {
+        self.vars.borrow_mut().insert(var.into(), value).is_none()
+    }
+
+    /// returns Err if the variable was not defined
+    fn set_var(self: &Rc<Self>, var: &str, value: Value) -> Result<(), Value> {
+        if let Some(val) = self.vars.borrow_mut().get_mut(var) {
+            *val = value;
+            Ok(())
+        } else if let Some(parent) = &self.parent {
+            parent.set_var(var, value)
+        } else {
+            Err(value)
+        }
+    }
+
+    fn new_child(self: &Rc<Self>) -> Rc<Scope> {
+        Rc::new(Scope {
+            parent: Some(Rc::clone(self)),
+            vars: RefCell::new(Default::default()),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InfixOp {
     Add,
@@ -310,10 +383,10 @@ impl Display for Block {
 }
 
 impl Block {
-    fn eval(&self, variables: &mut HashMap<String, Value>) -> Result<Value, EvalError> {
+    fn eval(&self, scope: Rc<Scope>) -> Result<Value, EvalError> {
         let mut last = Value::Unit;
         for e in &self.exprs {
-            last = e.eval(variables)?;
+            last = e.eval(scope.clone())?;
         }
         if self.ret { Ok(last) } else { Ok(Value::Unit) }
     }
@@ -356,6 +429,20 @@ enum Ast {
         cond: Box<Ast>,
         body: Block,
         elze: Option<Block>,
+    },
+    While {
+        cond: Box<Ast>,
+        body: Block,
+    },
+    For {
+        var: String,
+        index: Option<String>,
+        array: Box<Ast>,
+        body: Block,
+    },
+    Range {
+        range: Box<(Ast, Ast)>,
+        close_end: bool,
     },
 }
 
@@ -413,6 +500,26 @@ impl Display for Ast {
                 }
                 write!(f, ")")
             }
+            Ast::While { cond, body } => {
+                write!(f, "(while {} {})", cond, body)
+            }
+            Ast::For {
+                var,
+                index,
+                array,
+                body,
+            } => {
+                write!(f, "(for {:?}, {:?} in {} {})", var, index, array, body)
+            }
+            Ast::Range { range, close_end } => {
+                write!(
+                    f,
+                    "({}{}{})",
+                    range.0,
+                    if *close_end { "..=" } else { ".." },
+                    range.1
+                )
+            }
         }
     }
 }
@@ -430,6 +537,10 @@ enum Value {
         body: Block,
     },
     Array(Vec<Value>),
+    Range {
+        range: Box<(Value, Value)>,
+        close_end: bool,
+    },
 }
 
 impl Display for Value {
@@ -450,10 +561,20 @@ impl Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Range { range, close_end } => {
+                write!(
+                    f,
+                    "{}{}{}",
+                    range.0,
+                    if *close_end { "..=" } else { ".." },
+                    range.1
+                )
+            }
         }
     }
 }
 
+#[expect(unused, reason = "debug printing")]
 #[derive(Debug)]
 enum EvalError {
     ExpectedVar,
@@ -466,13 +587,12 @@ enum EvalError {
 }
 
 impl Ast {
-    fn eval(&self, variables: &mut HashMap<String, Value>) -> Result<Value, EvalError> {
+    fn eval(&self, scope: Rc<Scope>) -> Result<Value, EvalError> {
         match self {
             Ast::Atom(token) => match token {
-                TokenTree::Ident(ident) => variables
-                    .get(ident)
-                    .ok_or_else(|| EvalError::UndefinedVariable(ident.clone()))
-                    .cloned(),
+                TokenTree::Ident(ident) => scope
+                    .get_var(ident)
+                    .ok_or_else(|| EvalError::UndefinedVariable(ident.clone())),
                 TokenTree::IntLit(n) => Ok(Value::Integer(*n as _)),
                 TokenTree::Keyword(Keyword::True) => Ok(Value::Bool(true)),
                 TokenTree::Keyword(Keyword::False) => Ok(Value::Bool(false)),
@@ -481,19 +601,19 @@ impl Ast {
             Ast::ArrayLit(items) => {
                 let mut items2 = Vec::with_capacity(items.len());
                 for i in items {
-                    items2.push(i.eval(variables)?);
+                    items2.push(i.eval(scope.clone())?);
                 }
                 Ok(Value::Array(items2))
             }
             Ast::PrefixOp { op, operand } => match op {
-                PrefixOp::Neg => match operand.eval(variables)? {
+                PrefixOp::Neg => match operand.eval(scope)? {
                     Value::Integer(n) => Ok(Value::Integer(n as _)),
                     v => Err(EvalError::ExpectedInt(v)),
                 },
             },
             Ast::PostfixOp { op, operand } => match op {
                 PostfixOp::Factorial => {
-                    let n = match operand.eval(variables)? {
+                    let n = match operand.eval(scope)? {
                         Value::Integer(n) => n,
                         v => return Err(EvalError::ExpectedInt(v)),
                     };
@@ -506,8 +626,8 @@ impl Ast {
                 }
             },
             Ast::BinOp { op, operands } => {
-                let mut int = |ast: &Ast| -> Result<i32, EvalError> {
-                    match ast.eval(variables)? {
+                let int = |ast: &Ast| -> Result<i32, EvalError> {
+                    match ast.eval(scope.clone())? {
                         Value::Integer(n) => Ok(n),
                         v => Err(EvalError::ExpectedInt(v)),
                     }
@@ -519,9 +639,8 @@ impl Ast {
                     InfixOp::Div => Ok(Value::Integer(int(&operands.0)? / int(&operands.1)?)),
                     InfixOp::Assign => match &operands.0 {
                         Ast::Atom(TokenTree::Ident(ident)) => {
-                            let value = operands.1.eval(variables)?;
-                            if let Some(var) = variables.get_mut(ident) {
-                                *var = value;
+                            let value = operands.1.eval(scope.clone())?;
+                            if scope.set_var(ident, value).is_ok() {
                                 Ok(Value::Unit)
                             } else {
                                 Err(EvalError::UndefinedVariable(ident.clone()))
@@ -531,14 +650,14 @@ impl Ast {
                         _ => Err(EvalError::ExpectedVar),
                     },
                     InfixOp::Equality => {
-                        let lhs = operands.0.eval(variables)?;
-                        let rhs = operands.1.eval(variables)?;
+                        let lhs = operands.0.eval(scope.clone())?;
+                        let rhs = operands.1.eval(scope.clone())?;
 
                         Ok(Value::Bool(lhs == rhs))
                     }
                     InfixOp::Cmp(cmp) => {
-                        let lhs = operands.0.eval(variables)?;
-                        let rhs = operands.1.eval(variables)?;
+                        let lhs = operands.0.eval(scope.clone())?;
+                        let rhs = operands.1.eval(scope.clone())?;
 
                         let result = match (lhs, rhs) {
                             (Value::Unit, Value::Unit) => cmp.has_equal(),
@@ -559,30 +678,30 @@ impl Ast {
             Ast::FunctionCall {
                 fun,
                 args: call_args,
-            } => match fun.eval(variables)? {
+            } => match fun.eval(scope.clone())? {
                 Value::NativeFn(fun) => {
                     let mut args = Vec::with_capacity(call_args.len());
                     for i in call_args {
-                        args.push(i.eval(variables)?);
+                        args.push(i.eval(scope.clone())?);
                     }
 
                     Ok(fun(&args))
                 }
                 Value::LambdaFn { args, body } => {
-                    let mut new_vars = variables.clone();
+                    let new_scope = scope.new_child();
                     for (i, a) in args.iter().enumerate() {
                         let val = if let Some(a) = call_args.get(i) {
-                            a.eval(variables)?
+                            a.eval(scope.clone())?
                         } else {
                             Value::Unit
                         };
 
-                        new_vars.insert(a.clone(), val);
+                        new_scope.declare_var(a, val);
                     }
 
                     let mut last = Value::Unit;
                     for e in &body.exprs {
-                        last = e.eval(&mut new_vars)?;
+                        last = e.eval(new_scope.clone())?;
                     }
 
                     if body.ret { Ok(last) } else { Ok(Value::Unit) }
@@ -590,11 +709,11 @@ impl Ast {
                 v => Err(EvalError::ExpectedFunction(v)),
             },
             Ast::Index { arr, idx } => {
-                let arr = match arr.eval(variables)? {
+                let arr = match arr.eval(scope.clone())? {
                     Value::Array(arr) => arr,
                     v => return Err(EvalError::ExpectedArray(v)),
                 };
-                let idx = match idx.eval(variables)? {
+                let idx = match idx.eval(scope.clone())? {
                     Value::Integer(n) => n,
                     v => return Err(EvalError::ExpectedInt(v)),
                 };
@@ -608,32 +727,93 @@ impl Ast {
             }
             Ast::Declare { var, val } => {
                 let val = if let Some(val) = val {
-                    val.eval(variables)?
+                    val.eval(scope.clone())?
                 } else {
                     Value::Unit
                 };
-                variables.insert(var.clone(), val);
+                scope.declare_var(var.clone(), val);
                 Ok(Value::Unit)
             }
-            Ast::Block(b) => b.eval(variables),
+            Ast::Block(b) => b.eval(scope.clone()),
             Ast::LambdaLit { args, block } => Ok(Value::LambdaFn {
                 args: args.clone(),
                 body: block.clone(),
             }),
             Ast::If { cond, body, elze } => {
-                let cond = match cond.eval(variables)? {
+                let cond = match cond.eval(scope.clone())? {
                     Value::Bool(b) => b,
                     v => return Err(EvalError::ExpectedBool(v)),
                 };
 
                 if cond {
-                    body.eval(variables)
+                    body.eval(scope.clone())
                 } else if let Some(elze) = elze {
-                    elze.eval(variables)
+                    elze.eval(scope.clone())
                 } else {
                     Ok(Value::Unit)
                 }
             }
+            Ast::While { cond, body } => {
+                let mut last = Value::Unit;
+                loop {
+                    match cond.eval(scope.clone())? {
+                        Value::Bool(false) => break,
+                        Value::Bool(true) => {}
+                        v => return Err(EvalError::ExpectedBool(v)),
+                    }
+
+                    last = body.eval(scope.clone())?;
+                }
+                Ok(last)
+            }
+            Ast::For {
+                var,
+                index,
+                array,
+                body,
+            } => {
+                let mut last = Value::Unit;
+                let array: &mut dyn Iterator<Item = Value> = match array.eval(scope.clone())? {
+                    Value::Array(a) => &mut a.into_iter(),
+                    Value::Range { range, close_end } => {
+                        let start = match range.0 {
+                            Value::Integer(n) => n,
+                            v => return Err(EvalError::ExpectedInt(v)),
+                        };
+                        let end = match range.1 {
+                            Value::Integer(n) => n,
+                            v => return Err(EvalError::ExpectedInt(v)),
+                        };
+
+                        if close_end {
+                            &mut (start..end).map(Value::Integer)
+                        } else {
+                            &mut (start..=end).map(Value::Integer)
+                        }
+                    }
+                    v => return Err(EvalError::ExpectedArray(v)),
+                };
+                let scope = scope.new_child();
+
+                scope.declare_var(var, Value::Unit);
+                if let Some(index) = index {
+                    scope.declare_var(index, Value::Unit);
+                }
+
+                for (i, item) in array.into_iter().enumerate() {
+                    scope.set_var(var, item).unwrap();
+                    if let Some(index) = index {
+                        scope.set_var(index, Value::Integer(i as _)).unwrap();
+                    }
+
+                    last = body.eval(scope.clone())?;
+                }
+                Ok(last)
+            }
+            Ast::Range { range, close_end } => Ok(Value::Range {
+                range: Box::new((range.0.eval(scope.clone())?, range.1.eval(scope.clone())?)),
+                close_end: *close_end,
+            }),
         }
     }
 }
@@ -688,6 +868,14 @@ where
         Some(Block { exprs, ret })
     }
 
+    fn take_token(&mut self, tt: &TokenTree) {
+        match self.lexer.next() {
+            Some(tok) if tok == *tt => {}
+            Some(tok) => panic!("Unexpected token: {:?}", tok),
+            None => panic!("Unexpected EOF"),
+        }
+    }
+
     // TODO: literal numbers for bp is hard
 
     // returns ((), u8) to be clear it's a prefix
@@ -704,8 +892,9 @@ where
             TokenTree::Punct(Punct::EqEq | Punct::Lt | Punct::Lte | Punct::Gte | Punct::Gt) => {
                 Some((2, 3))
             }
-            TokenTree::Punct(Punct::Plus | Punct::Minus) => Some((4, 5)),
-            TokenTree::Punct(Punct::Star | Punct::Slash) => Some((6, 7)),
+            TokenTree::Punct(Punct::DotDot | Punct::DotDotEq) => Some((4, 5)),
+            TokenTree::Punct(Punct::Plus | Punct::Minus) => Some((6, 7)),
+            TokenTree::Punct(Punct::Star | Punct::Slash) => Some((8, 9)),
             _ => None,
         }
     }
@@ -830,6 +1019,63 @@ where
                     elze,
                 }
             }
+            TokenTree::Keyword(Keyword::While) => {
+                let cond = self.parse_expr().unwrap();
+
+                let body = match self.lexer.next() {
+                    Some(TokenTree::Group {
+                        delim: GroupDelim::Brace,
+                        tokens,
+                    }) => Self::parse_block(tokens.into_iter())?,
+                    Some(tok) => panic!("Unexpected token: {:?}", tok),
+                    None => panic!("Unexpected EOF"),
+                };
+
+                Ast::While {
+                    cond: Box::new(cond),
+                    body,
+                }
+            }
+            TokenTree::Keyword(Keyword::For) => {
+                let var = match self.lexer.next() {
+                    Some(TokenTree::Ident(ident)) => ident,
+                    Some(tok) => panic!("Unexpected token: {:?}", tok),
+                    None => panic!("Unexpected EOF"),
+                };
+
+                let index = match self.lexer.next() {
+                    Some(TokenTree::Keyword(Keyword::In)) => None,
+                    Some(TokenTree::Punct(Punct::Comma)) => {
+                        let ident = match self.lexer.next() {
+                            Some(TokenTree::Ident(ident)) => ident,
+                            Some(tok) => panic!("Unexpected token: {:?}", tok),
+                            None => panic!("Unexpected EOF"),
+                        };
+                        self.take_token(&TokenTree::Keyword(Keyword::In));
+                        Some(ident)
+                    }
+                    Some(tok) => panic!("Unexpected token: {:?}", tok),
+                    None => panic!("Unexpected EOF"),
+                };
+
+                let array = self.parse_expr()?;
+
+                let body = match self.lexer.next() {
+                    Some(TokenTree::Group {
+                        delim: GroupDelim::Brace,
+                        tokens,
+                    }) => Self::parse_block(tokens.into_iter())?,
+                    Some(tok) => panic!("Unexpected token: {:?}", tok),
+                    None => panic!("Unexpected EOF"),
+                };
+
+                Ast::For {
+                    var,
+                    index,
+                    array: Box::new(array),
+                    body,
+                }
+            }
             tok @ (TokenTree::IntLit(_)
             | TokenTree::Ident(_)
             | TokenTree::Keyword(Keyword::True)
@@ -902,21 +1148,31 @@ where
 
                 let op = self.lexer.next().expect("checked above"); // take the peeked item
                 let rhs = self.parse_bp(r_bp)?;
-                lhs = Ast::BinOp {
-                    op: match op {
-                        TokenTree::Punct(Punct::Plus) => InfixOp::Add,
-                        TokenTree::Punct(Punct::Minus) => InfixOp::Sub,
-                        TokenTree::Punct(Punct::Star) => InfixOp::Mul,
-                        TokenTree::Punct(Punct::Slash) => InfixOp::Div,
-                        TokenTree::Punct(Punct::Eq) => InfixOp::Assign,
-                        TokenTree::Punct(Punct::EqEq) => InfixOp::Equality,
-                        TokenTree::Punct(Punct::Lt) => InfixOp::Cmp(Cmp::Less),
-                        TokenTree::Punct(Punct::Lte) => InfixOp::Cmp(Cmp::LessOrEq),
-                        TokenTree::Punct(Punct::Gte) => InfixOp::Cmp(Cmp::GreaterOrEq),
-                        TokenTree::Punct(Punct::Gt) => InfixOp::Cmp(Cmp::Greater),
-                        _ => unreachable!(),
+                lhs = match op {
+                    TokenTree::Punct(Punct::DotDot) => Ast::Range {
+                        range: Box::new((lhs, rhs)),
+                        close_end: false,
                     },
-                    operands: Box::new((lhs, rhs)),
+                    TokenTree::Punct(Punct::DotDotEq) => Ast::Range {
+                        range: Box::new((lhs, rhs)),
+                        close_end: true,
+                    },
+                    _ => Ast::BinOp {
+                        op: match op {
+                            TokenTree::Punct(Punct::Plus) => InfixOp::Add,
+                            TokenTree::Punct(Punct::Minus) => InfixOp::Sub,
+                            TokenTree::Punct(Punct::Star) => InfixOp::Mul,
+                            TokenTree::Punct(Punct::Slash) => InfixOp::Div,
+                            TokenTree::Punct(Punct::Eq) => InfixOp::Assign,
+                            TokenTree::Punct(Punct::EqEq) => InfixOp::Equality,
+                            TokenTree::Punct(Punct::Lt) => InfixOp::Cmp(Cmp::Less),
+                            TokenTree::Punct(Punct::Lte) => InfixOp::Cmp(Cmp::LessOrEq),
+                            TokenTree::Punct(Punct::Gte) => InfixOp::Cmp(Cmp::GreaterOrEq),
+                            TokenTree::Punct(Punct::Gt) => InfixOp::Cmp(Cmp::Greater),
+                            _ => unreachable!(),
+                        },
+                        operands: Box::new((lhs, rhs)),
+                    },
                 };
                 continue;
             }
@@ -933,23 +1189,24 @@ where
 }
 
 fn main() {
-    print!("> ");
-    let mut variables: HashMap<String, Value> = HashMap::from_iter([
-        (
-            "print".into(),
-            Value::NativeFn(|a| {
-                for (i, a) in a.iter().enumerate() {
-                    if i > 0 {
-                        print!(" ");
-                    }
-                    print!("{}", a);
+    let scope = Scope::new();
+
+    scope.declare_var(
+        "print",
+        Value::NativeFn(|a| {
+            for (i, a) in a.iter().enumerate() {
+                if i > 0 {
+                    print!(" ");
                 }
-                println!();
-                Value::Unit
-            }),
-        ),
-        ("debug".into(), Value::Bool(true)),
-    ]);
+                print!("{}", a);
+            }
+            println!();
+            Value::Unit
+        }),
+    );
+    scope.declare_var("debug", Value::Bool(true));
+
+    print!("> ");
     std::io::stdout().flush().unwrap();
     for l in std::io::stdin().lines() {
         let l = l.unwrap();
@@ -959,9 +1216,9 @@ fn main() {
             continue;
         }
 
-        let debug = variables
-            .get("debug")
-            .is_some_and(|v| *v == Value::Bool(true));
+        let debug = scope
+            .get_var("debug")
+            .is_some_and(|v| v == Value::Bool(true));
 
         if debug {
             let lex = Lexer::new(&l);
@@ -980,7 +1237,7 @@ fn main() {
                 print!("AST: {:?}", e);
                 println!("\n");
             }
-            match e.eval(&mut variables) {
+            match e.eval(scope.clone()) {
                 Ok(v) => println!("=> {}", v),
                 Err(e) => {
                     println!("ERROR: {:?}", e);
