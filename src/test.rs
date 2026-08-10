@@ -179,7 +179,7 @@ fn eval_complex() {
     let mut l = Lexer::new(s);
     let mut parser = Parser::new(&mut l);
     let ast = parser.parse_expr().unwrap();
-    let result = ast.eval(Scope::new()).unwrap();
+    let result = ast.eval_inner(Scope::new()).unwrap();
     assert_eq!(
         result,
         Value::Integer(1 + 2 * 3 / 4 + 6 * (3 + 2) + factorial(4))
@@ -199,7 +199,7 @@ fn eval_array() {
     let mut l = Lexer::new(s);
     let mut parser = Parser::new(&mut l);
     let ast = parser.parse_expr().unwrap();
-    let result = ast.eval(Scope::new()).unwrap();
+    let result = ast.eval_inner(Scope::new()).unwrap();
     assert_eq!(result, Value::Integer(expected));
 }
 
@@ -210,6 +210,6 @@ fn eval_array_complex() {
     let mut l = Lexer::new(s);
     let mut parser = Parser::new(&mut l);
     let ast = parser.parse_expr().unwrap();
-    let result = ast.eval(Scope::new()).unwrap();
+    let result = ast.eval_inner(Scope::new()).unwrap();
     assert_eq!(result, Value::Integer(expected));
 }
